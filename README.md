@@ -6,9 +6,11 @@
 [![JAX](https://img.shields.io/badge/JAX-accelerated-green.svg)](https://github.com/google/jax)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+Author's note: Hello, what brings you to this program? If you are here, I would love to hear your thoughts on this library and how you are using it. Just send me an email anytime. If you have any issues with it, please open an issue, or just tell me. I will likely get it fixed somewhat quickly.
+
 JAX-PCMCI is a library for causal discovery from time series data, implementing the PCMCI family of algorithms with GPU/TPU acceleration through JAX. It provides significant speedups over CPU-based implementations while maintaining scientific rigor.
 
-## 🚀 Key Features
+## Key Features
 
 - **GPU/TPU Acceleration**: Leverages JAX for massive parallelization
 - **PCMCI & PCMCI+**: Both lagged and contemporaneous causal discovery
@@ -20,7 +22,7 @@ JAX-PCMCI is a library for causal discovery from time series data, implementing 
 - **FDR Correction**: Built-in Benjamini-Hochberg and Bonferroni corrections
 - **Publication-Ready Visualization**: Graph and time series plots
 
-## 📦 Installation
+## Installation
 
 ### Basic Installation (CPU)
 
@@ -48,7 +50,7 @@ cd jax-pcmci
 pip install -e ".[dev]"
 ```
 
-## 🏃 Quick Start
+## Quick Start
 
 ### Basic PCMCI Analysis
 
@@ -101,7 +103,7 @@ pcmci = PCMCI(datahandler, cond_ind_test=test)
 results = pcmci.run(tau_max=3)
 ```
 
-## 📊 Available Independence Tests
+## Available Independence Tests
 
 ### ParCorr (Partial Correlation)
 
@@ -145,7 +147,7 @@ test = GPDCond(
 )
 ```
 
-## ⚙️ Configuration
+## Configuration
 
 ### Device Selection
 
@@ -179,7 +181,7 @@ config = PCMCIConfig(
 config.apply()
 ```
 
-## 📈 Working with Results
+## Working with Results
 
 ### Accessing Causal Links
 
@@ -226,7 +228,7 @@ with open('results.json', 'w') as f:
     json.dump(data, f, indent=2)
 ```
 
-## 🔬 Advanced Usage
+## Advanced Usage
 
 ### Custom Independence Test
 
@@ -268,7 +270,7 @@ config = PCMCIConfig(
 config.apply()
 ```
 
-## 📚 Algorithm Details
+## Algorithm Details
 
 ### PCMCI
 
@@ -304,14 +306,11 @@ PCMCI+ extends PCMCI to handle contemporaneous (τ=0) causal links:
 
 3. Spirtes, P., Glymour, C., & Scheines, R. (2000). "Causation, prediction, and search". MIT press.
 
-## 📄 License
+## License
 
 MIT License - see [LICENSE](LICENSE) for details.
 
-## 🤝 Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## 📧 Contact
 
-For questions or issues, please open a GitHub issue or contact the maintainers.
+For questions or issues, please open a GitHub issue or contact me at gpgabriel25@gmail.com
