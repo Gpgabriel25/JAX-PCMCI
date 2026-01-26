@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax-pcmci"
+version = "0.1.0"
+description = "High-performance causal discovery using PCMCI algorithms with JAX acceleration"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "JAX-PCMCI Contributors"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+keywords = ["causal-discovery", "pcmci", "jax", "time-series", "causality"]
+requires-python = ">=3.9"
+dependencies = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "networkx>=3.0",
+    "matplotlib>=3.7.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+]
+docs = [
+    "sphinx>=6.0.0",
+    "sphinx-rtd-theme>=1.2.0",
+    "sphinx-autodoc-typehints>=1.22.0",
+    "nbsphinx>=0.9.0",
+    "myst-parser>=1.0.0",
+]
+gpu = [
+    "jax[cuda12_pip]>=0.4.20",
+]
+tpu = [
+    "jax[tpu]>=0.4.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/jax-pcmci"
+Documentation = "https://jax-pcmci.readthedocs.io"
+Repository = "https://github.com/your-org/jax-pcmci"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jax_pcmci*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "D", "UP"]
+ignore = ["D100", "D104"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=jax_pcmci --cov-report=term-missing"

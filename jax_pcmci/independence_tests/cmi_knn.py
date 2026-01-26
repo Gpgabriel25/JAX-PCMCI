@@ -1,0 +1,551 @@
+"""
+Conditional Mutual Information (CMI) using k-Nearest Neighbors
+===============================================================
+
+This module implements the CMI-kNN estimator for nonlinear conditional
+independence testing, based on the Kraskov-Stögbauer-Grassberger (KSG)
+estimator.
+
+Mathematical Background
+-----------------------
+Conditional Mutual Information is defined as:
+
+    I(X; Y | Z) = H(X|Z) + H(Y|Z) - H(X,Y|Z)
+
+where H denotes entropy. For continuous variables, this is estimated
+using k-NN distances in the joint and marginal spaces.
+
+Under the null hypothesis of conditional independence (X ⊥ Y | Z),
+I(X; Y | Z) = 0.
+
+Example
+-------
+>>> from jax_pcmci.independence_tests import CMIKnn
+>>> import jax.numpy as jnp
+>>>
+>>> test = CMIKnn(k=5)
+>>> X = jnp.array([1., 2., 3., 4., 5.])
+>>> Y = jnp.sin(X)  # Nonlinear relationship
+>>> result = test.run(X, Y)
+>>> print(f"CMI: {result.statistic:.3f}")
+"""
+
+from __future__ import annotations
+
+from functools import partial
+from typing import Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.scipy.special import digamma
+
+from jax_pcmci.independence_tests.base import CondIndTest
+from jax_pcmci.config import get_config
+
+
+class CMIKnn(CondIndTest):
+    """
+    Conditional Mutual Information test using k-Nearest Neighbors.
+
+    This nonlinear independence test estimates conditional mutual information
+    using the KSG estimator with k-nearest neighbors. It can detect nonlinear
+    dependencies that linear tests like ParCorr would miss.
+
+    Parameters
+    ----------
+    k : int, default=10
+        Number of nearest neighbors for CMI estimation.
+        Higher k gives lower variance but higher bias.
+    significance : str, default='permutation'
+        Method for computing p-values:
+        - 'permutation': Recommended for CMI
+        - 'shuffle_neighbors': Faster but less accurate
+    n_permutations : int, default=500
+        Number of permutations for significance testing.
+    alpha : float, default=0.05
+        Significance level.
+    metric : str, default='chebyshev'
+        Distance metric for k-NN:
+        - 'chebyshev': Maximum norm (recommended, matches KSG paper)
+        - 'euclidean': L2 norm
+    standardize : bool, default=True
+        Whether to standardize variables before computing distances.
+        Recommended for variables on different scales.
+
+    Attributes
+    ----------
+    name : str
+        'CMIKnn'
+    measure : str
+        'conditional_mutual_information'
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from jax_pcmci.independence_tests import CMIKnn
+    >>>
+    >>> # Basic nonlinear relationship
+    >>> test = CMIKnn(k=10, n_permutations=200)
+    >>> key = jax.random.PRNGKey(0)
+    >>> X = jax.random.normal(key, shape=(500,))
+    >>> Y = jnp.sin(2 * X) + 0.1 * jax.random.normal(key, shape=(500,))
+    >>> result = test.run(X, Y)
+    >>> print(f"CMI: {result.statistic:.4f}, p-value: {result.pvalue:.4f}")
+    >>>
+    >>> # With conditioning variables
+    >>> Z = jax.random.normal(key, shape=(500, 2))
+    >>> result = test.run(X, Y, Z)
+
+    Notes
+    -----
+    CMI-kNN is computationally more expensive than ParCorr due to the
+    k-NN search. For large datasets, consider:
+
+    1. Reducing k (trades off accuracy for speed)
+    2. Subsampling the data
+    3. Using GPU acceleration
+
+    The test statistic (CMI) is always non-negative. Values close to 0
+    indicate independence, while higher values indicate stronger dependence.
+
+    References
+    ----------
+    .. [1] Kraskov, A., Stögbauer, H., & Grassberger, P. (2004).
+           "Estimating mutual information". Physical Review E, 69(6).
+    .. [2] Frenzel, S., & Pompe, B. (2007). "Partial mutual information
+           for coupling analysis of multivariate time series".
+           Physical Review Letters, 99(20).
+    """
+
+    name = "CMIKnn"
+    measure = "conditional_mutual_information"
+
+    def __init__(
+        self,
+        k: int = 10,
+        significance: str = "permutation",
+        n_permutations: int = 500,
+        alpha: float = 0.05,
+        metric: str = "chebyshev",
+        standardize: bool = True,
+        random_seed: Optional[int] = None,
+    ):
+        super().__init__(
+            significance=significance,
+            n_permutations=n_permutations,
+            alpha=alpha,
+            random_seed=random_seed,
+        )
+        self.k = k
+        self.metric = metric.lower()
+        self.standardize = standardize
+
+        if self.metric not in ("chebyshev", "euclidean"):
+            raise ValueError(f"metric must be 'chebyshev' or 'euclidean', got '{metric}'")
+        if k < 1:
+            raise ValueError(f"k must be at least 1, got {k}")
+
+    @partial(jax.jit, static_argnums=(0,))
+    def compute_statistic(
+        self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """
+        Compute Conditional Mutual Information I(X; Y | Z).
+
+        Uses the KSG estimator based on k-nearest neighbor distances.
+
+        Parameters
+        ----------
+        X : jax.Array
+            First variable, shape (n_samples,).
+        Y : jax.Array
+            Second variable, shape (n_samples,).
+        Z : jax.Array or None
+            Conditioning variables, shape (n_samples, n_conditions).
+
+        Returns
+        -------
+        jax.Array
+            CMI estimate (non-negative scalar).
+        """
+        dtype = get_config().dtype
+        X = jnp.asarray(X, dtype=dtype).reshape(-1, 1)
+        Y = jnp.asarray(Y, dtype=dtype).reshape(-1, 1)
+
+        if Z is None:
+            # Mutual information (no conditioning)
+            return self._compute_mi(X, Y)
+        else:
+            Z = jnp.asarray(Z, dtype=dtype)
+            if Z.ndim == 1:
+                Z = Z.reshape(-1, 1)
+            return self._compute_cmi(X, Y, Z)
+
+    def _compute_mi(self, X: jax.Array, Y: jax.Array) -> jax.Array:
+        """
+        Compute Mutual Information I(X; Y) using KSG estimator.
+        """
+        n = X.shape[0]
+        k = min(self.k, n - 1)
+
+        # Standardize if requested
+        if self.standardize:
+            X = (X - jnp.mean(X, axis=0)) / (jnp.std(X, axis=0) + 1e-10)
+            Y = (Y - jnp.mean(Y, axis=0)) / (jnp.std(Y, axis=0) + 1e-10)
+
+        # Joint space XY
+        XY = jnp.concatenate([X, Y], axis=1)
+
+        # Find k-th neighbor distance in joint space
+        eps = self._kth_neighbor_distance(XY, k)
+
+        # Count neighbors within eps in marginal spaces
+        n_X = self._count_neighbors(X, eps)
+        n_Y = self._count_neighbors(Y, eps)
+
+        # KSG estimator
+        mi = digamma(k) - jnp.mean(digamma(n_X + 1) + digamma(n_Y + 1)) + digamma(n)
+
+        return jnp.maximum(mi, 0.0)
+
+    def _compute_cmi(
+        self, X: jax.Array, Y: jax.Array, Z: jax.Array
+    ) -> jax.Array:
+        """
+        Compute Conditional Mutual Information I(X; Y | Z).
+
+        Uses the Frenzel-Pompe estimator:
+            I(X; Y | Z) = ψ(k) - <ψ(n_XZ + 1) + ψ(n_YZ + 1) - ψ(n_Z + 1)>
+
+        where n_XZ, n_YZ, n_Z are neighbor counts in subspaces.
+        """
+        n = X.shape[0]
+        k = min(self.k, n - 1)
+
+        # Standardize if requested
+        if self.standardize:
+            X = (X - jnp.mean(X, axis=0)) / (jnp.std(X, axis=0) + 1e-10)
+            Y = (Y - jnp.mean(Y, axis=0)) / (jnp.std(Y, axis=0) + 1e-10)
+            Z = (Z - jnp.mean(Z, axis=0)) / (jnp.std(Z, axis=0) + 1e-10)
+
+        # Build spaces
+        XZ = jnp.concatenate([X, Z], axis=1)
+        YZ = jnp.concatenate([Y, Z], axis=1)
+        XYZ = jnp.concatenate([X, Y, Z], axis=1)
+
+        # Find k-th neighbor distance in joint space XYZ
+        eps = self._kth_neighbor_distance(XYZ, k)
+
+        # Count neighbors within eps in subspaces
+        n_XZ = self._count_neighbors(XZ, eps)
+        n_YZ = self._count_neighbors(YZ, eps)
+        n_Z = self._count_neighbors(Z, eps)
+
+        # Frenzel-Pompe CMI estimator
+        cmi = (
+            digamma(k)
+            - jnp.mean(digamma(n_XZ + 1) + digamma(n_YZ + 1) - digamma(n_Z + 1))
+        )
+
+        return jnp.maximum(cmi, 0.0)
+
+    def _kth_neighbor_distance(self, data: jax.Array, k: int) -> jax.Array:
+        """
+        Find the distance to the k-th nearest neighbor for each point.
+        """
+        n = data.shape[0]
+
+        # Compute pairwise distances
+        if self.metric == "chebyshev":
+            # Maximum norm: max|x_i - y_i|
+            distances = self._chebyshev_distances(data, data)
+        else:
+            # Euclidean norm
+            distances = self._euclidean_distances(data, data)
+
+        # Set self-distance to infinity
+        distances = distances + jnp.eye(n) * jnp.inf
+
+        # Sort and get k-th neighbor (0-indexed, so k-1 after sorting)
+        sorted_distances = jnp.sort(distances, axis=1)
+        kth_distances = sorted_distances[:, k - 1]
+
+        return kth_distances
+
+    def _count_neighbors(self, data: jax.Array, eps: jax.Array) -> jax.Array:
+        """
+        Count number of points within distance eps for each point.
+        """
+        n = data.shape[0]
+
+        # Compute pairwise distances
+        if self.metric == "chebyshev":
+            distances = self._chebyshev_distances(data, data)
+        else:
+            distances = self._euclidean_distances(data, data)
+
+        # Count points strictly within eps (excluding self)
+        # Using < instead of <= as in standard KSG
+        within_eps = (distances < eps.reshape(-1, 1)) & (distances > 0)
+        counts = jnp.sum(within_eps, axis=1)
+
+        return counts
+
+    @staticmethod
+    @jax.jit
+    def _chebyshev_distances(X: jax.Array, Y: jax.Array) -> jax.Array:
+        """
+        Compute Chebyshev (max-norm) distances between all pairs.
+        """
+        # X: (n, d), Y: (m, d) -> output: (n, m)
+        return jnp.max(jnp.abs(X[:, None, :] - Y[None, :, :]), axis=2)
+
+    @staticmethod
+    @jax.jit
+    def _euclidean_distances(X: jax.Array, Y: jax.Array) -> jax.Array:
+        """
+        Compute Euclidean distances between all pairs.
+        """
+        # Using the identity: ||x-y||^2 = ||x||^2 + ||y||^2 - 2*x.y
+        XX = jnp.sum(X * X, axis=1)
+        YY = jnp.sum(Y * Y, axis=1)
+        XY = X @ Y.T
+        distances_sq = XX[:, None] + YY[None, :] - 2 * XY
+        return jnp.sqrt(jnp.maximum(distances_sq, 0.0))
+
+    @partial(jax.jit, static_argnums=(0, 2, 3))
+    def compute_pvalue(
+        self, statistic: jax.Array, n_samples: int, n_conditions: int
+    ) -> jax.Array:
+        """
+        Compute p-value for CMI.
+
+        For CMI, there's no simple analytical null distribution, so this
+        returns a placeholder. Use significance='permutation' for accurate
+        p-values.
+
+        Parameters
+        ----------
+        statistic : jax.Array
+            CMI value.
+        n_samples : int
+            Number of samples.
+        n_conditions : int
+            Number of conditioning variables.
+
+        Returns
+        -------
+        jax.Array
+            Approximate p-value (use permutation for accuracy).
+        """
+        # For CMI, we typically need permutation testing
+        # This is a rough approximation based on chi-squared null
+        # Under H0, 2*n*CMI ~ chi^2(1) approximately
+        from jax.scipy.stats import chi2
+
+        chi2_stat = 2 * n_samples * statistic
+        pvalue = 1.0 - chi2.cdf(chi2_stat, df=1)
+
+        return jnp.clip(pvalue, 0.0, 1.0)
+
+    def __repr__(self) -> str:
+        return (
+            f"CMIKnn(k={self.k}, significance='{self.significance}', "
+            f"alpha={self.alpha}, metric='{self.metric}')"
+        )
+
+
+class CMISymbolic(CondIndTest):
+    """
+    Symbolic CMI for fast nonlinear independence testing.
+
+    This is a faster alternative to CMI-kNN that discretizes continuous
+    variables into symbols and uses discrete entropy estimation.
+
+    Parameters
+    ----------
+    n_symbols : int, default=6
+        Number of symbols for discretization.
+    significance : str, default='analytic'
+        Method for computing p-values.
+    alpha : float, default=0.05
+        Significance level.
+
+    Notes
+    -----
+    Symbolic CMI is much faster than CMI-kNN but may miss subtle
+    nonlinear dependencies due to discretization.
+    """
+
+    name = "CMISymbolic"
+    measure = "symbolic_cmi"
+
+    def __init__(
+        self,
+        n_symbols: int = 6,
+        significance: str = "analytic",
+        n_permutations: int = 500,
+        alpha: float = 0.05,
+        random_seed: Optional[int] = None,
+    ):
+        super().__init__(
+            significance=significance,
+            n_permutations=n_permutations,
+            alpha=alpha,
+            random_seed=random_seed,
+        )
+        self.n_symbols = n_symbols
+
+    @partial(jax.jit, static_argnums=(0,))
+    def compute_statistic(
+        self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """
+        Compute symbolic CMI by discretizing variables.
+        """
+        # Discretize variables
+        X_sym = self._symbolize(X)
+        Y_sym = self._symbolize(Y)
+
+        if Z is None:
+            # Mutual information
+            return self._discrete_mi(X_sym, Y_sym)
+        else:
+            Z_sym = jax.vmap(self._symbolize, in_axes=1, out_axes=1)(Z)
+            return self._discrete_cmi(X_sym, Y_sym, Z_sym)
+
+    def _symbolize(self, x: jax.Array) -> jax.Array:
+        """
+        Convert continuous variable to discrete symbols using equal-frequency binning.
+        """
+        n = len(x)
+        # Sort and assign symbols based on rank
+        sorted_indices = jnp.argsort(x)
+        ranks = jnp.zeros(n, dtype=jnp.int32)
+        ranks = ranks.at[sorted_indices].set(jnp.arange(n))
+
+        # Map ranks to symbols
+        symbols = (ranks * self.n_symbols) // n
+
+        return symbols
+
+    def _discrete_mi(self, X: jax.Array, Y: jax.Array) -> jax.Array:
+        """
+        Compute discrete mutual information.
+        """
+        n = len(X)
+
+        # Joint distribution
+        joint_idx = X * self.n_symbols + Y
+        joint_counts = jnp.bincount(joint_idx, length=self.n_symbols**2)
+        joint_prob = joint_counts / n
+
+        # Marginal distributions
+        X_counts = jnp.bincount(X, length=self.n_symbols)
+        Y_counts = jnp.bincount(Y, length=self.n_symbols)
+        X_prob = X_counts / n
+        Y_prob = Y_counts / n
+
+        # MI = sum p(x,y) log(p(x,y) / (p(x)p(y)))
+        outer_prob = jnp.outer(X_prob, Y_prob).flatten()
+
+        # Avoid log(0)
+        valid = (joint_prob > 0) & (outer_prob > 0)
+        mi_terms = jnp.where(
+            valid,
+            joint_prob * jnp.log(joint_prob / (outer_prob + 1e-10) + 1e-10),
+            0.0
+        )
+
+        return jnp.sum(mi_terms)
+
+    def _discrete_cmi(
+        self, X: jax.Array, Y: jax.Array, Z: jax.Array
+    ) -> jax.Array:
+        """
+        Compute discrete conditional mutual information.
+
+        I(X; Y | Z) = H(X|Z) + H(Y|Z) - H(X,Y|Z)
+        """
+        # This is a simplified implementation
+        # For full implementation, would need to iterate over Z values
+        n = len(X)
+
+        # Encode Z as single variable
+        if Z.ndim == 1:
+            Z_enc = Z
+        else:
+            # Simple encoding: treat as base-n_symbols number
+            Z_enc = jnp.zeros(n, dtype=jnp.int32)
+            for i in range(Z.shape[1]):
+                Z_enc = Z_enc * self.n_symbols + Z[:, i].astype(jnp.int32)
+
+        # Compute conditional entropies
+        H_X_given_Z = self._conditional_entropy(X, Z_enc)
+        H_Y_given_Z = self._conditional_entropy(Y, Z_enc)
+        H_XY_given_Z = self._joint_conditional_entropy(X, Y, Z_enc)
+
+        cmi = H_X_given_Z + H_Y_given_Z - H_XY_given_Z
+
+        return jnp.maximum(cmi, 0.0)
+
+    def _conditional_entropy(self, X: jax.Array, Z: jax.Array) -> jax.Array:
+        """
+        Compute H(X|Z) = H(X,Z) - H(Z).
+        """
+        n = len(X)
+        n_Z = int(jnp.max(Z)) + 1
+
+        # Joint entropy H(X, Z)
+        joint_idx = X * n_Z + Z
+        n_joint = self.n_symbols * n_Z
+        joint_counts = jnp.bincount(joint_idx, length=n_joint)
+        joint_prob = joint_counts / n
+        H_XZ = -jnp.sum(jnp.where(joint_prob > 0, joint_prob * jnp.log(joint_prob + 1e-10), 0.0))
+
+        # Marginal entropy H(Z)
+        Z_counts = jnp.bincount(Z, length=n_Z)
+        Z_prob = Z_counts / n
+        H_Z = -jnp.sum(jnp.where(Z_prob > 0, Z_prob * jnp.log(Z_prob + 1e-10), 0.0))
+
+        return H_XZ - H_Z
+
+    def _joint_conditional_entropy(
+        self, X: jax.Array, Y: jax.Array, Z: jax.Array
+    ) -> jax.Array:
+        """
+        Compute H(X,Y|Z) = H(X,Y,Z) - H(Z).
+        """
+        n = len(X)
+        n_Z = int(jnp.max(Z)) + 1
+
+        # Joint entropy H(X, Y, Z)
+        joint_idx = (X * self.n_symbols + Y) * n_Z + Z
+        n_joint = self.n_symbols * self.n_symbols * n_Z
+        joint_counts = jnp.bincount(joint_idx, length=n_joint)
+        joint_prob = joint_counts / n
+        H_XYZ = -jnp.sum(jnp.where(joint_prob > 0, joint_prob * jnp.log(joint_prob + 1e-10), 0.0))
+
+        # Marginal entropy H(Z)
+        Z_counts = jnp.bincount(Z, length=n_Z)
+        Z_prob = Z_counts / n
+        H_Z = -jnp.sum(jnp.where(Z_prob > 0, Z_prob * jnp.log(Z_prob + 1e-10), 0.0))
+
+        return H_XYZ - H_Z
+
+    @partial(jax.jit, static_argnums=(0, 2, 3))
+    def compute_pvalue(
+        self, statistic: jax.Array, n_samples: int, n_conditions: int
+    ) -> jax.Array:
+        """
+        Compute p-value using chi-squared approximation.
+        """
+        from jax.scipy.stats import chi2
+
+        # Under H0, 2*n*CMI ~ chi^2(df) where df depends on dimensions
+        df = (self.n_symbols - 1) ** 2
+        chi2_stat = 2 * n_samples * statistic
+        pvalue = 1.0 - chi2.cdf(chi2_stat, df=df)
+
+        return jnp.clip(pvalue, 0.0, 1.0)

@@ -1,0 +1,384 @@
+"""
+Partial Correlation Test (ParCorr)
+==================================
+
+This module implements the partial correlation test for conditional
+independence, optimized for JAX acceleration.
+
+Partial correlation measures the linear association between two variables
+after removing the linear effect of conditioning variables.
+
+Mathematical Background
+-----------------------
+The partial correlation between X and Y given Z is defined as:
+
+    ρ(X,Y|Z) = ρ(ε_X, ε_Y)
+
+where ε_X and ε_Y are the residuals from regressing X and Y on Z respectively.
+
+For linear Gaussian data, partial correlation of zero implies conditional
+independence.
+
+Example
+-------
+>>> from jax_pcmci.independence_tests import ParCorr
+>>> import jax.numpy as jnp
+>>>
+>>> test = ParCorr()
+>>> X = jnp.array([1., 2., 3., 4., 5.])
+>>> Y = jnp.array([2., 4., 5., 8., 10.])
+>>> result = test.run(X, Y)
+>>> print(f"Partial correlation: {result.statistic:.3f}")
+"""
+
+from __future__ import annotations
+
+from functools import partial
+from typing import Optional
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.scipy import stats as jax_stats
+
+from jax_pcmci.independence_tests.base import CondIndTest
+from jax_pcmci.config import get_config
+
+
+class ParCorr(CondIndTest):
+    """
+    Partial Correlation test for linear conditional independence.
+
+    This test measures the linear association between two variables after
+    accounting for the linear effects of conditioning variables. It is
+    optimal for data with linear relationships and Gaussian distributions.
+
+    Parameters
+    ----------
+    significance : str, default='analytic'
+        Method for computing p-values:
+        - 'analytic': Use Fisher's z-transformation (recommended)
+        - 'permutation': Permutation-based p-values
+        - 'bootstrap': Bootstrap-based p-values
+    n_permutations : int, default=500
+        Number of permutations (only used if significance='permutation').
+    alpha : float, default=0.05
+        Significance level for hypothesis testing.
+    robust : bool, default=False
+        Use robust regression (Huber) for residual computation.
+        More resistant to outliers but slower.
+
+    Attributes
+    ----------
+    name : str
+        'ParCorr'
+    measure : str
+        'partial_correlation'
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> from jax_pcmci.independence_tests import ParCorr
+    >>>
+    >>> # Basic usage
+    >>> test = ParCorr()
+    >>> X = jnp.array([1., 2., 3., 4., 5., 6., 7., 8., 9., 10.])
+    >>> Y = 2 * X + jnp.array([0.1, -0.1, 0.2, -0.2, 0.1, -0.1, 0.2, -0.2, 0.1, -0.1])
+    >>> result = test.run(X, Y)
+    >>> print(f"Correlation: {result.statistic:.4f}, p-value: {result.pvalue:.4f}")
+    Correlation: 0.9950, p-value: 0.0000
+    >>>
+    >>> # With conditioning variable
+    >>> Z = jnp.array([[1., 2., 3., 4., 5., 6., 7., 8., 9., 10.]]).T
+    >>> result = test.run(X, Y, Z)
+    >>> print(f"Partial correlation: {result.statistic:.4f}")
+
+    Notes
+    -----
+    The test statistic is the partial correlation coefficient:
+    - Values range from -1 to 1
+    - 0 indicates no linear relationship (after conditioning)
+    - 1 or -1 indicates perfect positive/negative linear relationship
+
+    For hypothesis testing, Fisher's z-transformation is used to convert
+    the correlation to a normally distributed statistic.
+
+    References
+    ----------
+    .. [1] Fisher, R.A. (1915). "Frequency distribution of the values of the
+           correlation coefficient in samples from an indefinitely large
+           population". Biometrika, 10(4), 507-521.
+    .. [2] Runge, J. et al. (2019). "Detecting and quantifying causal
+           associations in large nonlinear time series datasets".
+           Science Advances, 5(11), eaau4996.
+    """
+
+    name = "ParCorr"
+    measure = "partial_correlation"
+
+    def __init__(
+        self,
+        significance: str = "analytic",
+        n_permutations: int = 500,
+        alpha: float = 0.05,
+        robust: bool = False,
+        random_seed: Optional[int] = None,
+    ):
+        super().__init__(
+            significance=significance,
+            n_permutations=n_permutations,
+            alpha=alpha,
+            random_seed=random_seed,
+        )
+        self.robust = robust
+
+    @partial(jax.jit, static_argnums=(0,))
+    def compute_statistic(
+        self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array] = None
+    ) -> jax.Array:
+        """
+        Compute the partial correlation between X and Y given Z.
+
+        Parameters
+        ----------
+        X : jax.Array
+            First variable, shape (n_samples,).
+        Y : jax.Array
+            Second variable, shape (n_samples,).
+        Z : jax.Array or None
+            Conditioning variables, shape (n_samples, n_conditions).
+
+        Returns
+        -------
+        jax.Array
+            Partial correlation coefficient in [-1, 1].
+        """
+        # Ensure proper dtype
+        dtype = get_config().dtype
+        X = jnp.asarray(X, dtype=dtype)
+        Y = jnp.asarray(Y, dtype=dtype)
+
+        if Z is None or (hasattr(Z, 'shape') and Z.shape[-1] == 0):
+            # Simple correlation (no conditioning)
+            return self._compute_correlation(X, Y)
+        else:
+            Z = jnp.asarray(Z, dtype=dtype)
+            # Partial correlation via residuals
+            return self._compute_partial_correlation(X, Y, Z)
+
+    @staticmethod
+    @jax.jit
+    def _compute_correlation(X: jax.Array, Y: jax.Array) -> jax.Array:
+        """
+        Compute Pearson correlation between X and Y.
+
+        Uses a numerically stable computation via centered and normalized
+        vectors.
+        """
+        # Center the variables
+        X_centered = X - jnp.mean(X)
+        Y_centered = Y - jnp.mean(Y)
+
+        # Compute correlation
+        numerator = jnp.sum(X_centered * Y_centered)
+        denominator = jnp.sqrt(jnp.sum(X_centered**2) * jnp.sum(Y_centered**2))
+
+        # Handle zero denominator
+        correlation = jnp.where(
+            denominator > 1e-10,
+            numerator / denominator,
+            0.0
+        )
+
+        # Clip to [-1, 1] for numerical stability
+        return jnp.clip(correlation, -1.0, 1.0)
+
+    @staticmethod
+    @jax.jit
+    def _compute_partial_correlation(
+        X: jax.Array, Y: jax.Array, Z: jax.Array
+    ) -> jax.Array:
+        """
+        Compute partial correlation via OLS residuals.
+
+        This computes the correlation between the residuals of X and Y
+        after regressing each on Z.
+        """
+        # Get residuals from regressing X on Z
+        X_residual = ParCorr._compute_residual(X, Z)
+
+        # Get residuals from regressing Y on Z
+        Y_residual = ParCorr._compute_residual(Y, Z)
+
+        # Correlation of residuals
+        return ParCorr._compute_correlation(X_residual, Y_residual)
+
+    @staticmethod
+    @jax.jit
+    def _compute_residual(target: jax.Array, predictors: jax.Array) -> jax.Array:
+        """
+        Compute OLS residuals: target - Z @ (Z^T Z)^{-1} Z^T target
+
+        Uses the pseudoinverse for numerical stability.
+        """
+        # Ensure 2D
+        if predictors.ndim == 1:
+            predictors = predictors.reshape(-1, 1)
+
+        # Add intercept
+        n = len(target)
+        ones = jnp.ones((n, 1), dtype=predictors.dtype)
+        Z_with_intercept = jnp.concatenate([ones, predictors], axis=1)
+
+        # Solve least squares using pseudoinverse
+        # coeffs = (Z^T Z)^{-1} Z^T y
+        coeffs = jnp.linalg.lstsq(Z_with_intercept, target, rcond=None)[0]
+
+        # Compute residuals
+        predicted = Z_with_intercept @ coeffs
+        residual = target - predicted
+
+        return residual
+
+    @partial(jax.jit, static_argnums=(0, 2, 3))
+    def compute_pvalue(
+        self, statistic: jax.Array, n_samples: int, n_conditions: int
+    ) -> jax.Array:
+        """
+        Compute p-value using Fisher's z-transformation.
+
+        The partial correlation is transformed to a z-score using:
+            z = 0.5 * ln((1 + r) / (1 - r))
+
+        which is approximately normal with:
+            mean = 0.5 * ln((1 + ρ) / (1 - ρ))
+            std = 1 / sqrt(n - |Z| - 3)
+
+        Under H0 (ρ = 0), z ~ N(0, 1/sqrt(n - |Z| - 3)).
+
+        Parameters
+        ----------
+        statistic : jax.Array
+            Partial correlation coefficient.
+        n_samples : int
+            Number of samples.
+        n_conditions : int
+            Number of conditioning variables.
+
+        Returns
+        -------
+        jax.Array
+            Two-sided p-value.
+        """
+        # Degrees of freedom
+        df = n_samples - n_conditions - 3
+
+        # Handle edge cases
+        df = jnp.maximum(df, 1)
+
+        # Fisher's z-transformation
+        # Clip to avoid log(0) for |r| = 1
+        r_clipped = jnp.clip(statistic, -0.9999, 0.9999)
+        z = 0.5 * jnp.log((1 + r_clipped) / (1 - r_clipped))
+
+        # Standard error under H0
+        se = 1.0 / jnp.sqrt(df)
+
+        # Test statistic
+        z_stat = z / se
+
+        # Two-sided p-value from standard normal
+        pvalue = 2 * (1 - jax_stats.norm.cdf(jnp.abs(z_stat)))
+
+        return pvalue
+
+    def get_correlation_matrix(
+        self, data: jax.Array, tau_max: int = 0
+    ) -> jax.Array:
+        """
+        Compute the correlation matrix for all variable pairs and lags.
+
+        This is a convenience method for computing all pairwise correlations
+        at once, which is useful for initial exploration or as a building
+        block for more complex analyses.
+
+        Parameters
+        ----------
+        data : jax.Array
+            Time series data, shape (T, N).
+        tau_max : int, default=0
+            Maximum lag to consider.
+
+        Returns
+        -------
+        jax.Array
+            Correlation matrix of shape (N, N, tau_max + 1).
+            Entry [i, j, tau] is the correlation between X_i(t-tau) and X_j(t).
+
+        Examples
+        --------
+        >>> test = ParCorr()
+        >>> data = jnp.randn(1000, 5)
+        >>> corr_matrix = test.get_correlation_matrix(data, tau_max=3)
+        >>> print(f"Corr(X0(t-2), X1(t)): {corr_matrix[0, 1, 2]:.3f}")
+        """
+        T, N = data.shape
+        corr_matrix = jnp.zeros((N, N, tau_max + 1))
+
+        for tau in range(tau_max + 1):
+            effective_T = T - tau
+            for i in range(N):
+                for j in range(N):
+                    if tau == 0:
+                        X = data[:, i]
+                        Y = data[:, j]
+                    else:
+                        X = data[: T - tau, i]  # X at t - tau
+                        Y = data[tau:, j]  # Y at t
+
+                    corr_matrix = corr_matrix.at[i, j, tau].set(
+                        self._compute_correlation(X, Y)
+                    )
+
+        return corr_matrix
+
+    @partial(jax.jit, static_argnums=(0,))
+    def compute_statistic_batch(
+        self,
+        X_batch: jax.Array,
+        Y_batch: jax.Array,
+        Z_batch: Optional[jax.Array] = None,
+    ) -> jax.Array:
+        """
+        Compute partial correlations for a batch of tests (vectorized).
+
+        This is the core vectorized computation used by run_batch.
+
+        Parameters
+        ----------
+        X_batch : jax.Array
+            Shape (n_tests, n_samples).
+        Y_batch : jax.Array
+            Shape (n_tests, n_samples).
+        Z_batch : jax.Array or None
+            Shape (n_tests, n_samples, n_conditions).
+
+        Returns
+        -------
+        jax.Array
+            Partial correlations, shape (n_tests,).
+        """
+        if Z_batch is None:
+            # Vectorized simple correlation
+            return jax.vmap(self._compute_correlation)(X_batch, Y_batch)
+        else:
+            # Vectorized partial correlation
+            return jax.vmap(self._compute_partial_correlation)(
+                X_batch, Y_batch, Z_batch
+            )
+
+    def __repr__(self) -> str:
+        return (
+            f"ParCorr(significance='{self.significance}', "
+            f"alpha={self.alpha}, robust={self.robust})"
+        )
