@@ -163,6 +163,15 @@ class PCMCI:
         self._pval_matrix: Optional[jax.Array] = None
         self._val_matrix: Optional[jax.Array] = None
 
+    def _get_effective_batch_size(self) -> Optional[int]:
+        """Resolve effective batch size for memory-aware batching."""
+        config = get_config()
+        if config.batch_size is not None:
+            return config.batch_size
+        if config.memory_efficient:
+            return 256
+        return None
+
     def run(
         self,
         tau_max: int = 1,
@@ -411,26 +420,36 @@ class PCMCI:
                     
                     parents_to_remove = []
                     
-                    # Process each lag group as a batch
+                    # Process each lag group in memory-aware batches
+                    batch_size = self._get_effective_batch_size()
                     for tau, parents_with_tau in parents_by_lag.items():
-                        batch_data = []
-                        parent_list = []
-                        for parent in parents_with_tau:
-                            i, _ = parent
-                            X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
-                            batch_data.append((X, Y))
-                            parent_list.append(parent)
-                        
-                        # Run batch test for this lag group
-                        X_batch = jnp.stack([d[0] for d in batch_data])
-                        Y_batch = jnp.stack([d[1] for d in batch_data])
-                        stats, pvals = self.test.run_batch(X_batch, Y_batch, None, alpha=pc_alpha)
-                        
-                        # Mark non-significant (independent) parents for removal
-                        for idx, (val, pval) in enumerate(zip(stats, pvals)):
-                            if float(pval) > pc_alpha:  # Not significant = independent
-                                parents_to_remove.append(parent_list[idx])
-                                any_removed = True
+                        if batch_size is None:
+                            chunk_ranges = [(0, len(parents_with_tau))]
+                        else:
+                            chunk_ranges = [
+                                (start, min(start + batch_size, len(parents_with_tau)))
+                                for start in range(0, len(parents_with_tau), batch_size)
+                            ]
+
+                        for start, end in chunk_ranges:
+                            batch_data = []
+                            parent_list = []
+                            for parent in parents_with_tau[start:end]:
+                                i, _ = parent
+                                X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
+                                batch_data.append((X, Y))
+                                parent_list.append(parent)
+                            
+                            # Run batch test for this lag group chunk
+                            X_batch = jnp.stack([d[0] for d in batch_data])
+                            Y_batch = jnp.stack([d[1] for d in batch_data])
+                            stats, pvals = self.test.run_batch(X_batch, Y_batch, None, alpha=pc_alpha)
+                            
+                            # Mark non-significant (independent) parents for removal
+                            for idx, (val, pval) in enumerate(zip(stats, pvals)):
+                                if float(pval) > pc_alpha:  # Not significant = independent
+                                    parents_to_remove.append(parent_list[idx])
+                                    any_removed = True
                     
                     for parent in parents_to_remove:
                         parents[j].discard(parent)
@@ -555,31 +574,41 @@ class PCMCI:
                     if not result.significant:
                         return True
                 else:
-                    # Batch test all subsets in this group
-                    X_batch = []
-                    Y_batch = []
-                    Z_batch = []
-                    
-                    for subset in subsets_group:
-                        condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
-                        X, Y, Z = self.datahandler.get_variable_pair_data(
-                            i, j, tau, condition_indices
-                        )
-                        X_batch.append(X)
-                        Y_batch.append(Y)
-                        Z_batch.append(Z)
-                    
-                    # Stack into arrays
-                    X_arr = jnp.stack(X_batch, axis=0)
-                    Y_arr = jnp.stack(Y_batch, axis=0)
-                    Z_arr = jnp.stack(Z_batch, axis=0)
-                    
-                    # Run batch test
-                    stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr, alpha=pc_alpha)
-                    
-                    # Check if any are independent (p-value > alpha)
-                    if bool(jnp.any(pvals > pc_alpha)):
-                        return True
+                    # Batch test subsets in memory-aware chunks
+                    batch_size = self._get_effective_batch_size()
+                    if batch_size is None:
+                        chunk_ranges = [(0, len(subsets_group))]
+                    else:
+                        chunk_ranges = [
+                            (start, min(start + batch_size, len(subsets_group)))
+                            for start in range(0, len(subsets_group), batch_size)
+                        ]
+
+                    for start, end in chunk_ranges:
+                        X_batch = []
+                        Y_batch = []
+                        Z_batch = []
+                        
+                        for subset in subsets_group[start:end]:
+                            condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
+                            X, Y, Z = self.datahandler.get_variable_pair_data(
+                                i, j, tau, condition_indices
+                            )
+                            X_batch.append(X)
+                            Y_batch.append(Y)
+                            Z_batch.append(Z)
+                        
+                        # Stack into arrays
+                        X_arr = jnp.stack(X_batch, axis=0)
+                        Y_arr = jnp.stack(Y_batch, axis=0)
+                        Z_arr = jnp.stack(Z_batch, axis=0)
+                        
+                        # Run batch test
+                        stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr, alpha=pc_alpha)
+                        
+                        # Check if any are independent (p-value > alpha)
+                        if bool(jnp.any(pvals > pc_alpha)):
+                            return True
             
             return False
         
@@ -824,35 +853,45 @@ class PCMCI:
             if len(tests) == 0:
                 continue
 
-            # Prepare batch data
-            X_batch = []
-            Y_batch = []
-            Z_batch = [] if n_cond > 0 else None
-            test_indices = []
+            batch_size = self._get_effective_batch_size()
+            if batch_size is None:
+                chunk_ranges = [(0, len(tests))]
+            else:
+                chunk_ranges = [
+                    (start, min(start + batch_size, len(tests)))
+                    for start in range(0, len(tests), batch_size)
+                ]
 
-            for i, j, tau, cond_set in tests:
-                if cond_set:
-                    X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, cond_set)
-                    Z_batch.append(Z)
-                else:
-                    X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
+            for start, end in chunk_ranges:
+                # Prepare batch data
+                X_batch = []
+                Y_batch = []
+                Z_batch = [] if n_cond > 0 else None
+                test_indices = []
 
-                X_batch.append(X)
-                Y_batch.append(Y)
-                test_indices.append((i, j, tau))
+                for i, j, tau, cond_set in tests[start:end]:
+                    if cond_set:
+                        X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, cond_set)
+                        Z_batch.append(Z)
+                    else:
+                        X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
 
-            # Stack into arrays
-            X_arr = jnp.stack(X_batch, axis=0)
-            Y_arr = jnp.stack(Y_batch, axis=0)
-            Z_arr = jnp.stack(Z_batch, axis=0) if Z_batch else None
+                    X_batch.append(X)
+                    Y_batch.append(Y)
+                    test_indices.append((i, j, tau))
 
-            # Run batch test
-            stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr)
+                # Stack into arrays
+                X_arr = jnp.stack(X_batch, axis=0)
+                Y_arr = jnp.stack(Y_batch, axis=0)
+                Z_arr = jnp.stack(Z_batch, axis=0) if Z_batch else None
 
-            # Store results
-            for idx, (i, j, tau) in enumerate(test_indices):
-                val_matrix = val_matrix.at[i, j, tau].set(stats[idx])
-                pval_matrix = pval_matrix.at[i, j, tau].set(pvals[idx])
+                # Run batch test
+                stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr)
+
+                # Store results
+                for idx, (i, j, tau) in enumerate(test_indices):
+                    val_matrix = val_matrix.at[i, j, tau].set(stats[idx])
+                    pval_matrix = pval_matrix.at[i, j, tau].set(pvals[idx])
 
         return val_matrix, pval_matrix
 
