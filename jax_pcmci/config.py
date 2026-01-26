@@ -125,6 +125,14 @@ class PCMCIConfig:
         Verbosity level (0=silent, 1=normal, 2=verbose, 3=debug).
     cache_results : bool, default=True
         Cache intermediate results to avoid redundant computations.
+    cache_max_entries : int, default=4096
+        Maximum number of cached variable-pair slices.
+    gpu_preallocate : bool, default=True
+        Whether JAX preallocates most GPU memory at startup.
+    gpu_memory_fraction : float or None, default=None
+        Fraction of GPU memory to allocate (e.g., 0.7). None = JAX default.
+    gpu_allocator : str or None, default=None
+        GPU allocator backend, e.g. 'platform' or 'bfc'. None = JAX default.
 
     Examples
     --------
@@ -147,16 +155,20 @@ class PCMCIConfig:
     Use the context manager interface for temporary configuration changes.
     """
 
-    precision: Union[Precision, str] = "float64"
+    precision: Union[Precision, str] = "float32"
     parallelization: Union[ParallelizationMode, str] = "auto"
     random_seed: Optional[int] = None
     jit_compile: bool = True
-    enable_x64: bool = True
+    enable_x64: bool = False
     memory_efficient: bool = False
     batch_size: Optional[int] = None
     progress_bar: bool = True
     verbosity: int = 1
     cache_results: bool = True
+    cache_max_entries: int = 4096
+    gpu_preallocate: bool = True
+    gpu_memory_fraction: Optional[float] = None
+    gpu_allocator: Optional[str] = None
     _previous_config: Optional["PCMCIConfig"] = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -174,6 +186,25 @@ class PCMCIConfig:
         # Validate batch_size
         if self.batch_size is not None and self.batch_size < 1:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+
+        if self.cache_max_entries < 1:
+            raise ValueError(
+                f"cache_max_entries must be positive, got {self.cache_max_entries}"
+            )
+
+        if self.gpu_memory_fraction is not None:
+            if not (0.0 < self.gpu_memory_fraction <= 1.0):
+                raise ValueError(
+                    "gpu_memory_fraction must be in (0, 1], got "
+                    f"{self.gpu_memory_fraction}"
+                )
+        if self.gpu_allocator is not None:
+            self.gpu_allocator = self.gpu_allocator.lower()
+            if self.gpu_allocator not in ("platform", "bfc"):
+                raise ValueError(
+                    "gpu_allocator must be 'platform' or 'bfc', got "
+                    f"{self.gpu_allocator}"
+                )
 
     def apply(self) -> None:
         """
@@ -193,6 +224,17 @@ class PCMCIConfig:
         # Apply JAX-specific settings
         # Keep JAX and our dtype setting consistent to avoid silent truncation.
         jax_config.update("jax_enable_x64", bool(self.enable_x64))
+
+        # Configure GPU memory behavior (must be set before first GPU use).
+        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = (
+            "true" if self.gpu_preallocate else "false"
+        )
+        if self.gpu_memory_fraction is not None:
+            os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(
+                self.gpu_memory_fraction
+            )
+        if self.gpu_allocator is not None:
+            os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = self.gpu_allocator
 
         if self.verbosity >= 2:
             print(f"Applied configuration: {self}")

@@ -29,7 +29,9 @@ Example
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+from collections import OrderedDict
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -284,6 +286,15 @@ class DataHandler:
         # Cache for lagged data cubes - keyed by (tau_max, include_contemporaneous)
         self._lagged_cache: Dict[Tuple[int, bool], Tuple[jax.Array, jax.Array]] = {}
 
+        # Cache for variable pair slices
+        config = get_config()
+        self._pair_cache: Optional[
+            "OrderedDict[Tuple, Tuple[jax.Array, jax.Array, Optional[jax.Array]]]"
+        ] = (
+            OrderedDict() if config.cache_results else None
+        )
+        self._pair_cache_max = config.cache_max_entries
+
         # Handle missing values
         if missing_flag is not None:
             self._handle_missing(missing_flag)
@@ -442,23 +453,25 @@ class DataHandler:
         # Current values (t = tau_max, tau_max+1, ..., T-1)
         X_current = self.values[tau_max:]
 
-        # Build lagged array using vectorized operations
+        # Build lagged array using lax.scan to reduce Python overhead
         if include_contemporaneous:
-            # Include lag 0, 1, ..., tau_max
-            n_lags = tau_max + 1
-            # Use list comprehension + stack for efficiency
-            lagged_slices = [
-                self.values[tau_max - lag : T - lag if lag > 0 else None]
-                for lag in range(n_lags)
-            ]
-            X_lagged = jnp.stack(lagged_slices, axis=-1)
+            lags = jnp.arange(0, tau_max + 1)
         else:
-            # Only lags 1, 2, ..., tau_max
-            lagged_slices = [
-                self.values[tau_max - lag : T - lag]
-                for lag in range(1, tau_max + 1)
-            ]
-            X_lagged = jnp.stack(lagged_slices, axis=-1)
+            lags = jnp.arange(1, tau_max + 1)
+
+        n_lags = int(lags.shape[0])
+        X_lagged_init = jnp.zeros((effective_T, N, n_lags), dtype=self.values.dtype)
+
+        def body(carry, lag_idx):
+            lag = lags[lag_idx]
+            start_t = tau_max - lag
+            slice_t = lax.dynamic_slice(
+                self.values, (start_t, 0), (effective_T, N)
+            )
+            carry = carry.at[:, :, lag_idx].set(slice_t)
+            return carry, None
+
+        X_lagged, _ = lax.scan(body, X_lagged_init, jnp.arange(n_lags))
 
         # Store in cache
         self._lagged_cache[cache_key] = (X_current, X_lagged)
@@ -468,6 +481,8 @@ class DataHandler:
     def clear_cache(self) -> None:
         """Clear the lagged data cache to free memory."""
         self._lagged_cache.clear()
+        if self._pair_cache is not None:
+            self._pair_cache.clear()
 
     def precompute_lagged_data(self, tau_max: int) -> None:
         """
@@ -527,6 +542,16 @@ class DataHandler:
         if tau < 0:
             raise ValueError(f"tau must be non-negative, got {tau}")
 
+        cache_key = None
+        if self._pair_cache is not None:
+            cond_key = None
+            if condition_indices:
+                cond_key = tuple(sorted(condition_indices))
+            cache_key = (i, j, tau, cond_key)
+            if cache_key in self._pair_cache:
+                self._pair_cache.move_to_end(cache_key)
+                return self._pair_cache[cache_key]
+
         # Determine the effective time range
         max_lag = tau
         if condition_indices:
@@ -560,6 +585,87 @@ class DataHandler:
         else:
             Z = None
 
+        if self._pair_cache is not None and cache_key is not None:
+            self._pair_cache[cache_key] = (X, Y, Z)
+            self._pair_cache.move_to_end(cache_key)
+            if len(self._pair_cache) > self._pair_cache_max:
+                self._pair_cache.popitem(last=False)
+
+        return X, Y, Z
+
+    @staticmethod
+    @partial(jax.jit, static_argnums=(3,))
+    def _batch_slice_1d(
+        values: jax.Array,
+        start_idxs: jax.Array,
+        var_idxs: jax.Array,
+        length: int,
+    ) -> jax.Array:
+        """Vectorized 1D slice extraction using dynamic slicing."""
+
+        def slice_one(start_idx, var_idx):
+            return lax.dynamic_slice(values, (start_idx, var_idx), (length, 1)).squeeze(1)
+
+        return jax.vmap(slice_one)(start_idxs, var_idxs)
+
+    def get_variable_pair_batch(
+        self,
+        i_arr: jax.Array,
+        j_arr: jax.Array,
+        tau_arr: jax.Array,
+        cond_vars: Optional[jax.Array] = None,
+        cond_lags: Optional[jax.Array] = None,
+        max_lag: Optional[int] = None,
+    ) -> Tuple[jax.Array, jax.Array, Optional[jax.Array]]:
+        """
+        Get batched data for testing conditional independence across pairs.
+
+        Parameters
+        ----------
+        i_arr : jax.Array
+            Source variable indices, shape (batch,).
+        j_arr : jax.Array
+            Target variable indices, shape (batch,).
+        tau_arr : jax.Array
+            Lags for each pair, shape (batch,).
+        cond_vars : jax.Array, optional
+            Conditioning variable indices, shape (batch, n_cond).
+        cond_lags : jax.Array, optional
+            Conditioning lags, shape (batch, n_cond).
+        max_lag : int, optional
+            Precomputed max lag for alignment.
+        """
+        if max_lag is None:
+            max_lag = int(jnp.max(tau_arr))
+            if cond_lags is not None:
+                max_lag = max(max_lag, int(jnp.max(cond_lags)))
+
+        effective_T = self.T - max_lag
+        if effective_T <= 0:
+            raise ValueError(
+                f"Not enough data points. T={self.T}, max_lag={max_lag}"
+            )
+
+        start_x = max_lag - tau_arr
+        start_y = jnp.full_like(tau_arr, max_lag)
+
+        X = self._batch_slice_1d(self.values, start_x, i_arr, effective_T)
+        Y = self._batch_slice_1d(self.values, start_y, j_arr, effective_T)
+
+        if cond_vars is None or cond_lags is None:
+            return X, Y, None
+
+        n_cond = cond_vars.shape[1]
+        Z = jnp.zeros((cond_vars.shape[0], effective_T, n_cond), dtype=self.values.dtype)
+
+        def body(k, z):
+            vars_col = cond_vars[:, k]
+            lags_col = cond_lags[:, k]
+            starts = max_lag - lags_col
+            z_k = self._batch_slice_1d(self.values, starts, vars_col, effective_T)
+            return z.at[:, :, k].set(z_k)
+
+        Z = lax.fori_loop(0, n_cond, body, Z)
         return X, Y, Z
 
     @staticmethod

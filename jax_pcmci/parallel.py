@@ -174,48 +174,110 @@ def chunked_vmap(
     >>> results = batched_fn(large_batch)  # Processes in chunks of 1000
     """
     vmapped = jit(vmap(fn, in_axes=in_axes))
-    
-    def chunked_fn(*args):
-        # Determine batch size from first arg with batch axis
+
+    def _get_batch_size(args) -> int:
         if isinstance(in_axes, int):
-            batch_size = args[0].shape[in_axes]
-        else:
-            for i, ax in enumerate(in_axes):
-                if ax is not None:
-                    batch_size = args[i].shape[ax]
-                    break
-        
+            return args[0].shape[in_axes]
+        for i, ax in enumerate(in_axes):
+            if ax is not None:
+                return args[i].shape[ax]
+        raise ValueError("Could not determine batch axis from in_axes")
+
+    def _pad_arg(arg: jnp.ndarray, ax: Optional[int], pad_size: int) -> jnp.ndarray:
+        if ax is None or pad_size == 0:
+            return arg
+        pad_width = [(0, 0)] * arg.ndim
+        pad_width[ax] = (0, pad_size)
+        return jnp.pad(arg, pad_width)
+
+    def _slice_arg(arg: jnp.ndarray, ax: Optional[int], start: int) -> jnp.ndarray:
+        if ax is None:
+            return arg
+        start_indices = [0] * arg.ndim
+        start_indices[ax] = start
+        slice_sizes = list(arg.shape)
+        slice_sizes[ax] = chunk_size
+        return jax.lax.dynamic_slice(arg, start_indices, slice_sizes)
+
+    def chunked_fn(*args):
+        batch_size = _get_batch_size(args)
         if batch_size <= chunk_size:
             return vmapped(*args)
-        
-        # Split into chunks
+
         n_chunks = (batch_size + chunk_size - 1) // chunk_size
-        results = []
-        
-        for i in range(n_chunks):
-            start = i * chunk_size
-            end = min((i + 1) * chunk_size, batch_size)
-            
-            # Slice each batched argument
+        padded_size = n_chunks * chunk_size
+        pad_size = padded_size - batch_size
+
+        padded_args = []
+        for j, arg in enumerate(args):
+            ax = in_axes if isinstance(in_axes, int) else in_axes[j]
+            padded_args.append(_pad_arg(arg, ax, pad_size))
+
+        if progress_callback is not None:
+            # Python loop to allow progress callbacks
+            outputs = None
+            for i in range(n_chunks):
+                start = i * chunk_size
+                chunk_args = []
+                for j, arg in enumerate(padded_args):
+                    ax = in_axes if isinstance(in_axes, int) else in_axes[j]
+                    chunk_args.append(_slice_arg(arg, ax, start))
+
+                chunk_result = vmapped(*tuple(chunk_args))
+                if outputs is None:
+                    outputs = jax.tree_util.tree_map(
+                        lambda x: jnp.zeros((padded_size,) + x.shape[1:], x.dtype),
+                        chunk_result,
+                    )
+                outputs = jax.tree_util.tree_map(
+                    lambda out, res: jax.lax.dynamic_update_slice(
+                        out, res, (start,) + (0,) * (res.ndim - 1)
+                    ),
+                    outputs,
+                    chunk_result,
+                )
+                progress_callback(min(start + chunk_size, batch_size), batch_size)
+
+            return jax.tree_util.tree_map(lambda x: x[:batch_size], outputs)
+
+        # JAX-friendly scan for memory-efficient chunking
+        def scan_body(carry, idx):
+            start = idx * chunk_size
             chunk_args = []
-            for j, arg in enumerate(args):
+            for j, arg in enumerate(padded_args):
                 ax = in_axes if isinstance(in_axes, int) else in_axes[j]
-                if ax is not None:
-                    slices = [slice(None)] * arg.ndim
-                    slices[ax] = slice(start, end)
-                    chunk_args.append(arg[tuple(slices)])
-                else:
-                    chunk_args.append(arg)
-            
+                chunk_args.append(_slice_arg(arg, ax, start))
             chunk_result = vmapped(*tuple(chunk_args))
-            results.append(chunk_result)
-            
-            if progress_callback is not None:
-                progress_callback(end, batch_size)
-        
-        # Concatenate results
-        return jnp.concatenate(results, axis=0)
-    
+            updated = jax.tree_util.tree_map(
+                lambda out, res: jax.lax.dynamic_update_slice(
+                    out, res, (start,) + (0,) * (res.ndim - 1)
+                ),
+                carry,
+                chunk_result,
+            )
+            return updated, None
+
+        # Allocate output using the first chunk's shape
+        first_chunk_args = []
+        for j, arg in enumerate(padded_args):
+            ax = in_axes if isinstance(in_axes, int) else in_axes[j]
+            first_chunk_args.append(_slice_arg(arg, ax, 0))
+        first_result = vmapped(*tuple(first_chunk_args))
+        output_init = jax.tree_util.tree_map(
+            lambda x: jnp.zeros((padded_size,) + x.shape[1:], x.dtype),
+            first_result,
+        )
+        output_init = jax.tree_util.tree_map(
+            lambda out, res: jax.lax.dynamic_update_slice(
+                out, res, (0,) + (0,) * (res.ndim - 1)
+            ),
+            output_init,
+            first_result,
+        )
+
+        output_final, _ = jax.lax.scan(scan_body, output_init, jnp.arange(1, n_chunks))
+        return jax.tree_util.tree_map(lambda x: x[:batch_size], output_final)
+
     return chunked_fn
 
 

@@ -163,13 +163,52 @@ class PCMCI:
         self._pval_matrix: Optional[jax.Array] = None
         self._val_matrix: Optional[jax.Array] = None
 
-    def _get_effective_batch_size(self) -> Optional[int]:
-        """Resolve effective batch size for memory-aware batching."""
+    def _get_effective_batch_size(self, n_samples: Optional[int] = None, n_conditions: int = 0) -> Optional[int]:
+        """
+        Resolve effective batch size for memory-aware batching.
+        
+        Dynamically computes batch size based on available GPU memory
+        if not explicitly configured.
+        
+        Parameters
+        ----------
+        n_samples : int, optional
+            Number of samples per test (for memory estimation).
+        n_conditions : int, default=0
+            Number of conditioning variables (for memory estimation).
+            
+        Returns
+        -------
+        int or None
+            Batch size, or None for unlimited batching.
+        """
         config = get_config()
         if config.batch_size is not None:
             return config.batch_size
         if config.memory_efficient:
             return 256
+            
+        # Auto-compute batch size based on GPU memory
+        if n_samples is not None:
+            try:
+                device = jax.devices()[0]
+                if hasattr(device, 'memory_stats'):
+                    mem_stats = device.memory_stats() or {}
+                    # Use bytes_limit if available, otherwise estimate 8GB
+                    total_mem = mem_stats.get('bytes_limit', 8 * 1024**3)
+                    in_use = mem_stats.get('bytes_in_use', 0)
+                    available = (total_mem - in_use) * 0.7  # Use 70% of available
+                    
+                    # Estimate bytes per test: (X + Y + Z) * dtype_size * 3 (intermediates)
+                    dtype_size = 4 if config.precision.value == 'float32' else 8
+                    bytes_per_test = n_samples * (2 + n_conditions) * dtype_size * 3
+                    
+                    if bytes_per_test > 0:
+                        computed_batch = max(64, int(available / bytes_per_test))
+                        return min(computed_batch, 4096)  # Cap at reasonable max
+            except Exception:
+                pass  # Fall through to None
+        
         return None
 
     def run(
@@ -280,6 +319,9 @@ class PCMCI:
             max_conds_dim=max_conds_dim,
             max_subsets=max_subsets,
         )
+
+        # Clear cache between phases to free memory
+        self.datahandler.clear_cache()
 
         # Phase 2: MCI tests
         if self.verbosity >= 1:
@@ -421,7 +463,9 @@ class PCMCI:
                     parents_to_remove = []
                     
                     # Process each lag group in memory-aware batches
-                    batch_size = self._get_effective_batch_size()
+                    # Estimate n_samples for this tau
+                    effective_T = self.T - max(parents_by_lag.keys())
+                    batch_size = self._get_effective_batch_size(n_samples=effective_T, n_conditions=0)
                     for tau, parents_with_tau in parents_by_lag.items():
                         if batch_size is None:
                             chunk_ranges = [(0, len(parents_with_tau))]
@@ -432,17 +476,21 @@ class PCMCI:
                             ]
 
                         for start, end in chunk_ranges:
-                            batch_data = []
                             parent_list = []
                             for parent in parents_with_tau[start:end]:
-                                i, _ = parent
-                                X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
-                                batch_data.append((X, Y))
                                 parent_list.append(parent)
                             
+                            i_arr = jnp.asarray([p[0] for p in parent_list], dtype=jnp.int32)
+                            j_arr = jnp.full((len(parent_list),), j, dtype=jnp.int32)
+                            tau_arr = jnp.full((len(parent_list),), tau, dtype=jnp.int32)
+                            X_batch, Y_batch, _ = self.datahandler.get_variable_pair_batch(
+                                i_arr,
+                                j_arr,
+                                tau_arr,
+                                max_lag=tau,
+                            )
+                            
                             # Run batch test for this lag group chunk
-                            X_batch = jnp.stack([d[0] for d in batch_data])
-                            Y_batch = jnp.stack([d[1] for d in batch_data])
                             stats, pvals = self.test.run_batch(X_batch, Y_batch, None, alpha=pc_alpha)
                             
                             # Mark non-significant (independent) parents for removal
@@ -575,7 +623,8 @@ class PCMCI:
                         return True
                 else:
                     # Batch test subsets in memory-aware chunks
-                    batch_size = self._get_effective_batch_size()
+                    effective_T = self.T - max_lag
+                    batch_size = self._get_effective_batch_size(n_samples=effective_T, n_conditions=cond_dim)
                     if batch_size is None:
                         chunk_ranges = [(0, len(subsets_group))]
                     else:
@@ -585,23 +634,28 @@ class PCMCI:
                         ]
 
                     for start, end in chunk_ranges:
-                        X_batch = []
-                        Y_batch = []
-                        Z_batch = []
-                        
+                        cond_vars_list = []
+                        cond_lags_list = []
                         for subset in subsets_group[start:end]:
                             condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
-                            X, Y, Z = self.datahandler.get_variable_pair_data(
-                                i, j, tau, condition_indices
-                            )
-                            X_batch.append(X)
-                            Y_batch.append(Y)
-                            Z_batch.append(Z)
-                        
-                        # Stack into arrays
-                        X_arr = jnp.stack(X_batch, axis=0)
-                        Y_arr = jnp.stack(Y_batch, axis=0)
-                        Z_arr = jnp.stack(Z_batch, axis=0)
+                            cond_vars_list.append([var for var, _ in condition_indices])
+                            cond_lags_list.append([lag for _, lag in condition_indices])
+
+                        batch_len = end - start
+                        i_arr = jnp.full((batch_len,), i, dtype=jnp.int32)
+                        j_arr = jnp.full((batch_len,), j, dtype=jnp.int32)
+                        tau_arr = jnp.full((batch_len,), tau, dtype=jnp.int32)
+                        cond_vars = jnp.asarray(cond_vars_list, dtype=jnp.int32)
+                        cond_lags = jnp.asarray(cond_lags_list, dtype=jnp.int32)
+
+                        X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
+                            i_arr,
+                            j_arr,
+                            tau_arr,
+                            cond_vars=cond_vars,
+                            cond_lags=cond_lags,
+                            max_lag=max_lag,
+                        )
                         
                         # Run batch test
                         stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr, alpha=pc_alpha)
@@ -853,7 +907,8 @@ class PCMCI:
             if len(tests) == 0:
                 continue
 
-            batch_size = self._get_effective_batch_size()
+            effective_T = self.T - max_lag
+            batch_size = self._get_effective_batch_size(n_samples=effective_T, n_conditions=n_cond)
             if batch_size is None:
                 chunk_ranges = [(0, len(tests))]
             else:
@@ -863,35 +918,54 @@ class PCMCI:
                 ]
 
             for start, end in chunk_ranges:
-                # Prepare batch data
-                X_batch = []
-                Y_batch = []
-                Z_batch = [] if n_cond > 0 else None
                 test_indices = []
+                i_list = []
+                j_list = []
+                tau_list = []
+                cond_vars_list = [] if n_cond > 0 else None
+                cond_lags_list = [] if n_cond > 0 else None
 
                 for i, j, tau, cond_set in tests[start:end]:
-                    if cond_set:
-                        X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, cond_set)
-                        Z_batch.append(Z)
-                    else:
-                        X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
-
-                    X_batch.append(X)
-                    Y_batch.append(Y)
                     test_indices.append((i, j, tau))
+                    i_list.append(i)
+                    j_list.append(j)
+                    tau_list.append(tau)
+                    if n_cond > 0:
+                        cond_vars_list.append([var for var, _ in cond_set])
+                        cond_lags_list.append([lag for _, lag in cond_set])
 
-                # Stack into arrays
-                X_arr = jnp.stack(X_batch, axis=0)
-                Y_arr = jnp.stack(Y_batch, axis=0)
-                Z_arr = jnp.stack(Z_batch, axis=0) if Z_batch else None
+                i_arr = jnp.asarray(i_list, dtype=jnp.int32)
+                j_arr = jnp.asarray(j_list, dtype=jnp.int32)
+                tau_arr = jnp.asarray(tau_list, dtype=jnp.int32)
+
+                if n_cond > 0:
+                    cond_vars = jnp.asarray(cond_vars_list, dtype=jnp.int32)
+                    cond_lags = jnp.asarray(cond_lags_list, dtype=jnp.int32)
+                    X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
+                        i_arr,
+                        j_arr,
+                        tau_arr,
+                        cond_vars=cond_vars,
+                        cond_lags=cond_lags,
+                        max_lag=max_lag,
+                    )
+                else:
+                    X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
+                        i_arr,
+                        j_arr,
+                        tau_arr,
+                        max_lag=max_lag,
+                    )
 
                 # Run batch test
                 stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr)
 
-                # Store results
-                for idx, (i, j, tau) in enumerate(test_indices):
-                    val_matrix = val_matrix.at[i, j, tau].set(stats[idx])
-                    pval_matrix = pval_matrix.at[i, j, tau].set(pvals[idx])
+                # Store results (vectorized scatter)
+                i_arr = jnp.asarray([idx[0] for idx in test_indices], dtype=jnp.int32)
+                j_arr = jnp.asarray([idx[1] for idx in test_indices], dtype=jnp.int32)
+                tau_arr = jnp.asarray([idx[2] for idx in test_indices], dtype=jnp.int32)
+                val_matrix = val_matrix.at[i_arr, j_arr, tau_arr].set(stats)
+                pval_matrix = pval_matrix.at[i_arr, j_arr, tau_arr].set(pvals)
 
         return val_matrix, pval_matrix
 
