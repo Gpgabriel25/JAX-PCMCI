@@ -46,6 +46,8 @@ import jax.numpy as jnp
 from jax import lax
 from functools import partial
 from tqdm import tqdm
+from itertools import combinations
+import random
 
 from jax_pcmci.data import DataHandler
 from jax_pcmci.independence_tests.base import CondIndTest, TestResult
@@ -505,45 +507,147 @@ class PCMCI:
                     if self.verbosity >= 2 and parents_to_remove:
                         print(f"  Removed {len(parents_to_remove)} parents from X{j} (batch)")
             else:
-                # Standard sequential testing for cond_dim > 0
-                for j in self.selected_variables:
-                    current_parents = list(parents_snapshot[j])
+                # Cond_dim > 0: Optimize with batching across ALL parents/subsets
+                if hasattr(self.test, 'run_batch'):
+                    all_test_specs = []
+                    
+                    # 1. Collect all tests needed for this iteration
+                    for j in self.selected_variables:
+                        current_parents = list(parents_snapshot[j])
+                        if len(current_parents) <= cond_dim:
+                            continue
+                            
+                        for parent in current_parents:
+                            i, neg_tau = parent
+                            tau = -neg_tau
+                            other_parents = [p for p in current_parents if p != parent]
+                            
+                            if len(other_parents) >= cond_dim:
+                                all_subsets = list(combinations(other_parents, cond_dim))
+                                if len(all_subsets) > max_subsets:
+                                    random.seed(i * 1000 + j * 100 + tau + cond_dim)
+                                    subsets_to_test = random.sample(all_subsets, max_subsets)
+                                else:
+                                    subsets_to_test = all_subsets
+                                    
+                                for subset in subsets_to_test:
+                                    all_test_specs.append((j, parent, tau, subset))
 
-                    if len(current_parents) <= cond_dim:
-                        continue
+                    # 2. Group by max_lag to optimize data slicing/padding
+                    specs_by_lag = {}
+                    for spec in all_test_specs:
+                        j, parent, tau, subset = spec
+                        # Max lag determines effective sample size and slicing
+                        max_lag_in_subset = 0
+                        if subset:
+                            max_lag_in_subset = max(-p[1] for p in subset)
+                        effective_max_lag = max(tau, max_lag_in_subset)
+                        
+                        if effective_max_lag not in specs_by_lag:
+                            specs_by_lag[effective_max_lag] = []
+                        specs_by_lag[effective_max_lag].append(spec)
 
-                    # Test each parent
-                    parents_to_remove = []
+                    # 3. Process batches
+                    for max_lag, specs in specs_by_lag.items():
+                        # Determine batch size based on memory
+                        effective_T = self.T - max_lag
+                        batch_size = self._get_effective_batch_size(n_samples=effective_T, n_conditions=cond_dim)
+                        
+                        if batch_size is None or batch_size > len(specs):
+                            chunk_ranges = [(0, len(specs))]
+                        else:
+                            chunk_ranges = [
+                                (start, min(start + batch_size, len(specs)))
+                                for start in range(0, len(specs), batch_size)
+                            ]
+                        
+                        for start, end in chunk_ranges:
+                            batch_specs = specs[start:end]
+                            
+                            # Prepare arrays for batch call
+                            batch_len = len(batch_specs)
+                            i_arr = jnp.zeros(batch_len, dtype=jnp.int32)
+                            j_arr = jnp.zeros(batch_len, dtype=jnp.int32)
+                            tau_arr = jnp.zeros(batch_len, dtype=jnp.int32)
+                            
+                            # Cond vars/lags: (Batch, CondDim)
+                            cond_vars = jnp.zeros((batch_len, cond_dim), dtype=jnp.int32)
+                            cond_lags = jnp.zeros((batch_len, cond_dim), dtype=jnp.int32)
+                            
+                            # Flatten specs into array inputs
+                            for idx, (j, parent, tau, subset) in enumerate(batch_specs):
+                                i_arr = i_arr.at[idx].set(parent[0])
+                                j_arr = j_arr.at[idx].set(j)
+                                tau_arr = tau_arr.at[idx].set(tau)
+                                
+                                # subset is list of (var, neg_lag)
+                                if subset:
+                                    c_vars = [p[0] for p in subset]
+                                    c_lags = [-p[1] for p in subset]
+                                    cond_vars = cond_vars.at[idx].set(jnp.array(c_vars, dtype=jnp.int32))
+                                    cond_lags = cond_lags.at[idx].set(jnp.array(c_lags, dtype=jnp.int32))
 
-                    for parent in current_parents:
-                        i, neg_tau = parent
-                        tau = -neg_tau
-
-                        # Get possible conditioning sets (subsets of other parents)
-                        other_parents = [p for p in current_parents if p != parent]
-
-                        # Test with subsets of size cond_dim
-                        if len(other_parents) >= cond_dim:
-                            is_independent = self._test_with_conditioning_subsets(
-                                i=i,
-                                j=j,
-                                tau=tau,
-                                other_parents=other_parents,
-                                cond_dim=cond_dim,
-                                pc_alpha=pc_alpha,
-                                max_subsets=max_subsets,
+                            # Get data
+                            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                                i_arr, j_arr, tau_arr, cond_vars, cond_lags, max_lag=max_lag
                             )
+                            
+                            # Run tests
+                            stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
+                            
+                            # Process results
+                            # If pval > alpha, it's independent -> Remove parent
+                            for idx, pval in enumerate(pvals):
+                                if float(pval) > pc_alpha:
+                                    j_idx = batch_specs[idx][0]
+                                    p_idx = batch_specs[idx][1]
+                                    if p_idx in parents[j_idx]:
+                                        parents[j_idx].discard(p_idx)
+                                        any_removed = True
+                    
+                    if self.verbosity >= 2 and any_removed:
+                         print(f"  Batch removal completed for cond_dim {cond_dim}")
 
-                            if is_independent:
-                                parents_to_remove.append(parent)
-                                any_removed = True
+                else:
+                    # Sequential fallback
+                    for j in self.selected_variables:
+                        current_parents = list(parents_snapshot[j])
 
-                    # Remove independent parents
-                    for parent in parents_to_remove:
-                        parents[j].discard(parent)
+                        if len(current_parents) <= cond_dim:
+                            continue
 
-                    if self.verbosity >= 2 and parents_to_remove:
-                        print(f"  Removed {len(parents_to_remove)} parents from X{j}")
+                        # Test each parent
+                        parents_to_remove = []
+
+                        for parent in current_parents:
+                            i, neg_tau = parent
+                            tau = -neg_tau
+
+                            # Get possible conditioning sets (subsets of other parents)
+                            other_parents = [p for p in current_parents if p != parent]
+
+                            # Test with subsets of size cond_dim
+                            if len(other_parents) >= cond_dim:
+                                is_independent = self._test_with_conditioning_subsets(
+                                    i=i,
+                                    j=j,
+                                    tau=tau,
+                                    other_parents=other_parents,
+                                    cond_dim=cond_dim,
+                                    pc_alpha=pc_alpha,
+                                    max_subsets=max_subsets,
+                                )
+
+                                if is_independent:
+                                    parents_to_remove.append(parent)
+                                    any_removed = True
+
+                        # Remove independent parents
+                        for parent in parents_to_remove:
+                            parents[j].discard(parent)
+
+                        if self.verbosity >= 2 and parents_to_remove:
+                            print(f"  Removed {len(parents_to_remove)} parents from X{j}")
 
             if not any_removed:
                 # No removals - algorithm converged

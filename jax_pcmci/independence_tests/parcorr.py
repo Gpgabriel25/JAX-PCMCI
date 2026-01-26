@@ -40,6 +40,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.scipy import stats as jax_stats
+from jax.scipy import linalg
 
 from jax_pcmci.independence_tests.base import CondIndTest
 from jax_pcmci.config import get_config
@@ -219,24 +220,32 @@ class ParCorr(CondIndTest):
         """
         Compute OLS residuals: target - Z @ (Z^T Z)^{-1} Z^T target
 
-        Uses the pseudoinverse for numerical stability.
+        Optimized using Cholesky solve on centered data for speed and memory efficiency.
         """
         # Ensure 2D
         if predictors.ndim == 1:
             predictors = predictors.reshape(-1, 1)
 
-        # Add intercept
-        n = len(target)
-        ones = jnp.ones((n, 1), dtype=predictors.dtype)
-        Z_with_intercept = jnp.concatenate([ones, predictors], axis=1)
+        # Center data to avoid adding intercept column (saves memory/compute)
+        target_c = target - jnp.mean(target)
+        predictors_c = predictors - jnp.mean(predictors, axis=0)
 
-        # Solve least squares using pseudoinverse
-        # coeffs = (Z^T Z)^{-1} Z^T y
-        coeffs = jnp.linalg.lstsq(Z_with_intercept, target, rcond=None)[0]
+        # Solve normal equations: (Z^T Z) beta = Z^T y
+        # Using regularization for numerical stability (similar to rcond in lstsq)
+        gram = predictors_c.T @ predictors_c
+        
+        # Regularization proportional to trace or fixed small value
+        # 1e-6 is usually sufficient for stability
+        ridge = 1e-6 * jnp.eye(gram.shape[0], dtype=gram.dtype)
+        
+        # Compute coefficients: beta = (Z'Z + lambda*I)^-1 Z'y
+        # sym_pos=True uses Cholesky which is faster than general solve or lstsq
+        rhs = predictors_c.T @ target_c
+        coeffs = linalg.solve(gram + ridge, rhs, assume_a='pos')
 
         # Compute residuals
-        predicted = Z_with_intercept @ coeffs
-        residual = target - predicted
+        predicted = predictors_c @ coeffs
+        residual = target_c - predicted
 
         return residual
 
