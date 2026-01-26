@@ -281,6 +281,9 @@ class DataHandler:
             data_array = jnp.asarray(data, dtype=self._dtype)
             self._data = TimeSeriesData(values=data_array, var_names=var_names)
 
+        # Cache for lagged data cubes - keyed by (tau_max, include_contemporaneous)
+        self._lagged_cache: Dict[Tuple[int, bool], Tuple[jax.Array, jax.Array]] = {}
+
         # Handle missing values
         if missing_flag is not None:
             self._handle_missing(missing_flag)
@@ -401,7 +404,8 @@ class DataHandler:
         Construct lagged data matrices for PCMCI analysis.
 
         Creates aligned arrays where each row corresponds to a valid time point
-        with all lagged values available.
+        with all lagged values available. Results are cached for repeated calls
+        with the same parameters.
 
         Parameters
         ----------
@@ -427,32 +431,57 @@ class DataHandler:
         if tau_max < 1:
             raise ValueError(f"tau_max must be at least 1, got {tau_max}")
 
+        # Check cache
+        cache_key = (tau_max, include_contemporaneous)
+        if cache_key in self._lagged_cache:
+            return self._lagged_cache[cache_key]
+
         T, N = self.T, self.N
         effective_T = T - tau_max
 
         # Current values (t = tau_max, tau_max+1, ..., T-1)
         X_current = self.values[tau_max:]
 
-        # Build lagged array
+        # Build lagged array using vectorized operations
         if include_contemporaneous:
             # Include lag 0, 1, ..., tau_max
             n_lags = tau_max + 1
-            X_lagged = jnp.zeros((effective_T, N, n_lags), dtype=self._dtype)
-            for lag in range(n_lags):
-                # lag=0: current, lag=1: t-1, etc.
-                start_idx = tau_max - lag
-                end_idx = T - lag
-                X_lagged = X_lagged.at[:, :, lag].set(self.values[start_idx:end_idx])
+            # Use list comprehension + stack for efficiency
+            lagged_slices = [
+                self.values[tau_max - lag : T - lag if lag > 0 else None]
+                for lag in range(n_lags)
+            ]
+            X_lagged = jnp.stack(lagged_slices, axis=-1)
         else:
             # Only lags 1, 2, ..., tau_max
-            n_lags = tau_max
-            X_lagged = jnp.zeros((effective_T, N, n_lags), dtype=self._dtype)
-            for lag in range(1, tau_max + 1):
-                start_idx = tau_max - lag
-                end_idx = T - lag
-                X_lagged = X_lagged.at[:, :, lag - 1].set(self.values[start_idx:end_idx])
+            lagged_slices = [
+                self.values[tau_max - lag : T - lag]
+                for lag in range(1, tau_max + 1)
+            ]
+            X_lagged = jnp.stack(lagged_slices, axis=-1)
+
+        # Store in cache
+        self._lagged_cache[cache_key] = (X_current, X_lagged)
 
         return X_current, X_lagged
+
+    def clear_cache(self) -> None:
+        """Clear the lagged data cache to free memory."""
+        self._lagged_cache.clear()
+
+    def precompute_lagged_data(self, tau_max: int) -> None:
+        """
+        Precompute and cache lagged data for both contemporaneous options.
+        
+        Call this before running PCMCI to avoid recomputation during tests.
+        
+        Parameters
+        ----------
+        tau_max : int
+            Maximum time lag to precompute.
+        """
+        self.get_lagged_data(tau_max, include_contemporaneous=True)
+        self.get_lagged_data(tau_max, include_contemporaneous=False)
 
     def get_variable_pair_data(
         self,

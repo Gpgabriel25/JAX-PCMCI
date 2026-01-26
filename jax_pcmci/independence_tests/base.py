@@ -171,9 +171,16 @@ class CondIndTest(ABC):
         if n_permutations < 1:
             raise ValueError(f"n_permutations must be positive, got {n_permutations}")
 
-        # Set up random key
+        # Set up random key (fold-in counter ensures unique draws per call)
         seed = random_seed if random_seed is not None else 0
-        self._rng_key = jax.random.PRNGKey(seed)
+        self._base_key = jax.random.PRNGKey(seed)
+        self._rng_counter = 0
+
+        # Cached JITed batch runners to avoid Python overhead on repeated calls
+        self._run_batch_no_z = jax.jit(lambda X, Y: self._run_batch_no_z_impl(X, Y))
+        self._run_batch_with_z = jax.jit(
+            lambda X, Y, Z: self._run_batch_with_z_impl(X, Y, Z)
+        )
 
     @abstractmethod
     def compute_statistic(
@@ -351,46 +358,72 @@ class CondIndTest(ABC):
         Z_batch : jax.Array or None
             Batch of conditioning variables, shape (n_tests, n_samples, n_cond).
         alpha : float or None
-            Significance level.
-
-        Returns
-        -------
-        statistics : jax.Array
-            Test statistics for each test, shape (n_tests,).
-        pvalues : jax.Array
-            P-values for each test, shape (n_tests,).
-
-        Examples
-        --------
-        >>> test = ParCorr()
-        >>> # Test 100 pairs simultaneously
-        >>> X_batch = jnp.randn(100, 500)  # 100 tests, 500 samples each
-        >>> Y_batch = jnp.randn(100, 500)
-        >>> stats, pvals = test.run_batch(X_batch, Y_batch)
         """
-        alpha = alpha if alpha is not None else self.alpha
-
-        n_tests, n_samples = X_batch.shape
-        n_conditions = 0 if Z_batch is None else Z_batch.shape[2]
-
-        # Vectorized statistic computation
         if Z_batch is None:
-            compute_fn = lambda x, y: self.compute_statistic(x, y, None)
-            statistics = jax.vmap(compute_fn)(X_batch, Y_batch)
-        else:
-            statistics = jax.vmap(self.compute_statistic)(X_batch, Y_batch, Z_batch)
+            return self._run_batch_no_z(X_batch, Y_batch)
+        return self._run_batch_with_z(X_batch, Y_batch, Z_batch)
 
-        # Vectorized p-value computation (for analytic method)
+        return stats, pvals
+
+    # ----- JITed batch helpers -------------------------------------------------
+
+    def _run_batch_no_z_impl(
+        self, X_batch: jax.Array, Y_batch: jax.Array
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Fast path for batches without conditioning variables."""
+        n_samples = X_batch.shape[1]
+
+        statistics = jax.vmap(lambda x, y: self.compute_statistic(x, y, None))(
+            X_batch, Y_batch
+        )
+
         if self.significance == "analytic":
-            pvalue_fn = lambda s: self.compute_pvalue(s, n_samples, n_conditions)
-            pvalues = jax.vmap(pvalue_fn)(statistics)
+            pvalues = jax.vmap(lambda s: self.compute_pvalue(s, n_samples, 0))(statistics)
         else:
-            # Permutation/bootstrap for batch - more complex
+            pvalues = self._batch_permutation_pvalues(
+                X_batch, Y_batch, None, statistics
+            )
+
+        return statistics, pvalues
+
+    def _run_batch_with_z_impl(
+        self, X_batch: jax.Array, Y_batch: jax.Array, Z_batch: jax.Array
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Fast path for batches with conditioning variables."""
+        n_samples = X_batch.shape[1]
+        n_conditions = Z_batch.shape[2] if Z_batch.ndim == 3 else 1
+
+        statistics = jax.vmap(self.compute_statistic)(X_batch, Y_batch, Z_batch)
+
+        if self.significance == "analytic":
+            pvalues = jax.vmap(
+                lambda s: self.compute_pvalue(s, n_samples, n_conditions)
+            )(statistics)
+        else:
             pvalues = self._batch_permutation_pvalues(
                 X_batch, Y_batch, Z_batch, statistics
             )
 
         return statistics, pvalues
+
+    # ----- Shared helpers ----------------------------------------------------
+
+    def _next_key(self) -> jax.Array:
+        """Return a new RNG key derived from the base seed."""
+        self._rng_counter += 1
+        return jax.random.fold_in(self._base_key, self._rng_counter)
+
+    def _prepare_inputs(
+        self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array]
+    ) -> Tuple[jax.Array, jax.Array, Optional[jax.Array]]:
+        """Optional preprocessing for permutation/bootstrap (override in subclasses)."""
+        return X, Y, Z
+
+    def _statistic_from_prepared(
+        self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array]
+    ) -> jax.Array:
+        """Compute statistic from already-prepared inputs (override in subclasses)."""
+        return self.compute_statistic(X, Y, Z)
 
     def _permutation_pvalue(
         self,
@@ -399,29 +432,46 @@ class CondIndTest(ABC):
         Z: Optional[jax.Array],
         observed_stat: jax.Array,
     ) -> jax.Array:
-        """
-        Compute p-value using permutation testing.
+        """Compute p-value using permutation testing (fully vectorized)."""
+        key = self._next_key()
+        if Z is None:
+            return self._permutation_pvalue_no_z(X, Y, observed_stat, key)
+        return self._permutation_pvalue_with_z(X, Y, Z, observed_stat, key)
 
-        Permutes X while keeping Y (and Z) fixed to break any dependence,
-        then computes the null distribution of the test statistic.
-        """
-        n_samples = len(X)
+    @partial(jax.jit, static_argnums=(0,))
+    def _permutation_pvalue_no_z(
+        self, X: jax.Array, Y: jax.Array, observed_stat: jax.Array, key: jax.Array
+    ) -> jax.Array:
+        X_prep, Y_prep, _ = self._prepare_inputs(X, Y, None)
+        n_samples = X_prep.shape[0]
+        perm_keys = jax.random.split(key, self.n_permutations)
 
-        def single_permutation(key):
-            perm = jax.random.permutation(key, n_samples)
-            X_perm = X[perm]
-            return self.compute_statistic(X_perm, Y, Z)
+        def perm_stat(k):
+            perm = jax.random.permutation(k, n_samples)
+            return self._statistic_from_prepared(X_prep[perm], Y_prep, None)
 
-        # Generate permutation keys
-        keys = jax.random.split(self._rng_key, self.n_permutations)
+        null_stats = jax.vmap(perm_stat)(perm_keys)
+        return jnp.mean(jnp.abs(null_stats) >= jnp.abs(observed_stat))
 
-        # Compute null distribution
-        null_stats = jax.vmap(single_permutation)(keys)
+    @partial(jax.jit, static_argnums=(0,))
+    def _permutation_pvalue_with_z(
+        self,
+        X: jax.Array,
+        Y: jax.Array,
+        Z: jax.Array,
+        observed_stat: jax.Array,
+        key: jax.Array,
+    ) -> jax.Array:
+        X_prep, Y_prep, Z_prep = self._prepare_inputs(X, Y, Z)
+        n_samples = X_prep.shape[0]
+        perm_keys = jax.random.split(key, self.n_permutations)
 
-        # Two-sided p-value
-        pvalue = jnp.mean(jnp.abs(null_stats) >= jnp.abs(observed_stat))
+        def perm_stat(k):
+            perm = jax.random.permutation(k, n_samples)
+            return self._statistic_from_prepared(X_prep[perm], Y_prep, Z_prep)
 
-        return pvalue
+        null_stats = jax.vmap(perm_stat)(perm_keys)
+        return jnp.mean(jnp.abs(null_stats) >= jnp.abs(observed_stat))
 
     def _bootstrap_pvalue(
         self,
@@ -430,25 +480,48 @@ class CondIndTest(ABC):
         Z: Optional[jax.Array],
         observed_stat: jax.Array,
     ) -> jax.Array:
-        """
-        Compute p-value using bootstrap resampling.
-        """
-        n_samples = len(X)
+        """Compute p-value using bootstrap resampling (vectorized)."""
+        key = self._next_key()
+        if Z is None:
+            return self._bootstrap_pvalue_no_z(X, Y, observed_stat, key)
+        return self._bootstrap_pvalue_with_z(X, Y, Z, observed_stat, key)
 
-        def single_bootstrap(key):
-            indices = jax.random.choice(key, n_samples, shape=(n_samples,), replace=True)
-            X_boot = X[indices]
-            Y_boot = Y[indices]
-            Z_boot = Z[indices] if Z is not None else None
-            return self.compute_statistic(X_boot, Y_boot, Z_boot)
+    @partial(jax.jit, static_argnums=(0,))
+    def _bootstrap_pvalue_no_z(
+        self, X: jax.Array, Y: jax.Array, observed_stat: jax.Array, key: jax.Array
+    ) -> jax.Array:
+        X_prep, Y_prep, _ = self._prepare_inputs(X, Y, None)
+        n_samples = X_prep.shape[0]
+        boot_keys = jax.random.split(key, self.n_permutations)
 
-        keys = jax.random.split(self._rng_key, self.n_permutations)
-        boot_stats = jax.vmap(single_bootstrap)(keys)
+        def single_bootstrap(k):
+            idx = jax.random.choice(k, n_samples, shape=(n_samples,), replace=True)
+            return self._statistic_from_prepared(X_prep[idx], Y_prep[idx], None)
 
-        # Compute p-value as fraction of bootstrap samples with |stat| >= |observed|
-        pvalue = jnp.mean(jnp.abs(boot_stats) >= jnp.abs(observed_stat))
+        boot_stats = jax.vmap(single_bootstrap)(boot_keys)
+        return jnp.mean(jnp.abs(boot_stats) >= jnp.abs(observed_stat))
 
-        return pvalue
+    @partial(jax.jit, static_argnums=(0,))
+    def _bootstrap_pvalue_with_z(
+        self,
+        X: jax.Array,
+        Y: jax.Array,
+        Z: jax.Array,
+        observed_stat: jax.Array,
+        key: jax.Array,
+    ) -> jax.Array:
+        X_prep, Y_prep, Z_prep = self._prepare_inputs(X, Y, Z)
+        n_samples = X_prep.shape[0]
+        boot_keys = jax.random.split(key, self.n_permutations)
+
+        def single_bootstrap(k):
+            idx = jax.random.choice(k, n_samples, shape=(n_samples,), replace=True)
+            return self._statistic_from_prepared(
+                X_prep[idx], Y_prep[idx], Z_prep[idx]
+            )
+
+        boot_stats = jax.vmap(single_bootstrap)(boot_keys)
+        return jnp.mean(jnp.abs(boot_stats) >= jnp.abs(observed_stat))
 
     def _batch_permutation_pvalues(
         self,
@@ -457,31 +530,48 @@ class CondIndTest(ABC):
         Z_batch: Optional[jax.Array],
         observed_stats: jax.Array,
     ) -> jax.Array:
-        """
-        Compute permutation p-values for a batch of tests.
-        """
-        n_tests, n_samples = X_batch.shape
-
-        def compute_pvalue_single(args):
-            X, Y, Z, obs_stat, key = args
-            return self._permutation_pvalue_jit(X, Y, Z, obs_stat, key)
-
-        # This is a simplified version - in practice you'd want more sophisticated batching
-        keys = jax.random.split(self._rng_key, n_tests)
-
+        """Compute permutation p-values for a batch of tests (vectorized)."""
+        key = self._next_key()
         if Z_batch is None:
-            Z_list = [None] * n_tests
-        else:
-            Z_list = [Z_batch[i] for i in range(n_tests)]
+            return self._batch_permutation_pvalues_no_z(
+                X_batch, Y_batch, observed_stats, key
+            )
+        return self._batch_permutation_pvalues_with_z(
+            X_batch, Y_batch, Z_batch, observed_stats, key
+        )
 
-        # Use lax.map for sequential but compiled execution
-        pvalues = []
-        for i in range(n_tests):
-            Z_i = Z_batch[i] if Z_batch is not None else None
-            pval = self._permutation_pvalue(X_batch[i], Y_batch[i], Z_i, observed_stats[i])
-            pvalues.append(pval)
+    @partial(jax.jit, static_argnums=(0,))
+    def _batch_permutation_pvalues_no_z(
+        self,
+        X_batch: jax.Array,
+        Y_batch: jax.Array,
+        observed_stats: jax.Array,
+        key: jax.Array,
+    ) -> jax.Array:
+        n_tests = X_batch.shape[0]
+        keys = jax.random.split(key, n_tests)
 
-        return jnp.array(pvalues)
+        def single(x, y, obs, k):
+            return self._permutation_pvalue_no_z(x, y, obs, k)
+
+        return jax.vmap(single)(X_batch, Y_batch, observed_stats, keys)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _batch_permutation_pvalues_with_z(
+        self,
+        X_batch: jax.Array,
+        Y_batch: jax.Array,
+        Z_batch: jax.Array,
+        observed_stats: jax.Array,
+        key: jax.Array,
+    ) -> jax.Array:
+        n_tests = X_batch.shape[0]
+        keys = jax.random.split(key, n_tests)
+
+        def single(x, y, z, obs, k):
+            return self._permutation_pvalue_with_z(x, y, z, obs, k)
+
+        return jax.vmap(single)(X_batch, Y_batch, Z_batch, observed_stats, keys)
 
     def get_dependence_measure(
         self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array] = None

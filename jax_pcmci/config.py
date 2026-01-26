@@ -191,8 +191,8 @@ class PCMCIConfig:
         _GLOBAL_CONFIG = self
 
         # Apply JAX-specific settings
-        if self.enable_x64:
-            jax_config.update("jax_enable_x64", True)
+        # Keep JAX and our dtype setting consistent to avoid silent truncation.
+        jax_config.update("jax_enable_x64", bool(self.enable_x64))
 
         if self.verbosity >= 2:
             print(f"Applied configuration: {self}")
@@ -222,7 +222,12 @@ class PCMCIConfig:
         jnp.dtype
             The JAX dtype (jnp.float32 or jnp.float64).
         """
-        return jnp.float64 if self.precision == Precision.FLOAT64 else jnp.float32
+        # If x64 is disabled in JAX, float64 arrays are not representable.
+        # In that case we must use float32 to avoid repeated dtype truncation.
+        x64_enabled = bool(jax_config.read("jax_enable_x64"))
+        if self.precision == Precision.FLOAT64 and self.enable_x64 and x64_enabled:
+            return jnp.float64
+        return jnp.float32
 
     def get_rng_key(self) -> jax.random.PRNGKey:
         """

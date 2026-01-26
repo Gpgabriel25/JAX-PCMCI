@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jax-pcmci"
+name = "JAX-PCMCI"
 version = "0.1.0"
 description = "High-performance causal discovery using PCMCI algorithms with JAX acceleration"
 readme = "README.md"
@@ -59,9 +59,8 @@ tpu = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/jax-pcmci"
-Documentation = "https://jax-pcmci.readthedocs.io"
-Repository = "https://github.com/your-org/jax-pcmci"
+Homepage = "https://github.com/gpgabriel25/JAX-PCMCI"
+Repository = "https://github.com/gpgabriel25/JAX-PCMCI"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -171,6 +171,7 @@ class PCMCI:
         max_conds_dim: Optional[int] = None,
         max_conds_py: Optional[int] = None,
         max_conds_px: Optional[int] = None,
+        max_subsets: int = 100,
         alpha_level: float = 0.05,
         fdr_method: Optional[str] = None,
     ) -> PCMCIResults:
@@ -197,6 +198,9 @@ class PCMCI:
             Maximum conditions from target's parents. None means no limit.
         max_conds_px : int or None
             Maximum conditions from source's parents. None means no limit.
+        max_subsets : int, default=100
+            Maximum conditioning subsets to test per parent in PC phase.
+            Limits combinatorial explosion for high-dimensional data.
         alpha_level : float, default=0.05
             Significance level for final MCI tests.
         fdr_method : str or None
@@ -265,6 +269,7 @@ class PCMCI:
             tau_min=tau_min,
             pc_alpha=pc_alpha,
             max_conds_dim=max_conds_dim,
+            max_subsets=max_subsets,
         )
 
         # Phase 2: MCI tests
@@ -273,13 +278,24 @@ class PCMCI:
             print("PCMCI: Phase 2 - MCI Tests")
             print(f"{'='*60}")
 
-        val_matrix, pval_matrix = self.run_mci(
-            tau_max=tau_max,
-            tau_min=tau_min,
-            parents=self._parents,
-            max_conds_py=max_conds_py,
-            max_conds_px=max_conds_px,
-        )
+        # Use batch MCI by default for GPU/TPU acceleration
+        # Only falls back to sequential if batch test not available
+        if hasattr(self.test, 'run_batch'):
+            val_matrix, pval_matrix = self.run_batch_mci(
+                tau_max=tau_max,
+                tau_min=tau_min,
+                parents=self._parents,
+                max_conds_py=max_conds_py,
+                max_conds_px=max_conds_px,
+            )
+        else:
+            val_matrix, pval_matrix = self.run_mci(
+                tau_max=tau_max,
+                tau_min=tau_min,
+                parents=self._parents,
+                max_conds_py=max_conds_py,
+                max_conds_px=max_conds_px,
+            )
 
         # Store results
         self._val_matrix = val_matrix
@@ -308,6 +324,7 @@ class PCMCI:
         tau_min: int = 1,
         pc_alpha: Optional[float] = 0.05,
         max_conds_dim: Optional[int] = None,
+        max_subsets: int = 100,
     ) -> Dict[int, Set[Tuple[int, int]]]:
         """
         Run the PC-stable condition selection algorithm.
@@ -326,6 +343,9 @@ class PCMCI:
             Significance level. If None, keeps all parents.
         max_conds_dim : int or None
             Maximum conditioning set dimension.
+        max_subsets : int, default=100
+            Maximum number of conditioning subsets to test per parent.
+            Randomly samples if more subsets are available.
 
         Returns
         -------
@@ -373,43 +393,90 @@ class PCMCI:
             parents_snapshot = {j: parents[j].copy() for j in self.selected_variables}
             any_removed = False
 
-            for j in self.selected_variables:
-                current_parents = list(parents_snapshot[j])
+            # For cond_dim=0, use batch testing for efficiency
+            if cond_dim == 0 and hasattr(self.test, 'run_batch'):
+                for j in self.selected_variables:
+                    current_parents = list(parents_snapshot[j])
+                    if not current_parents:
+                        continue
+                    
+                    # Group parents by lag (same lag = same data length)
+                    parents_by_lag: Dict[int, List[Tuple[int, int]]] = {}
+                    for parent in current_parents:
+                        i, neg_tau = parent
+                        tau = -neg_tau
+                        if tau not in parents_by_lag:
+                            parents_by_lag[tau] = []
+                        parents_by_lag[tau].append(parent)
+                    
+                    parents_to_remove = []
+                    
+                    # Process each lag group as a batch
+                    for tau, parents_with_tau in parents_by_lag.items():
+                        batch_data = []
+                        parent_list = []
+                        for parent in parents_with_tau:
+                            i, _ = parent
+                            X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
+                            batch_data.append((X, Y))
+                            parent_list.append(parent)
+                        
+                        # Run batch test for this lag group
+                        X_batch = jnp.stack([d[0] for d in batch_data])
+                        Y_batch = jnp.stack([d[1] for d in batch_data])
+                        stats, pvals = self.test.run_batch(X_batch, Y_batch, None, alpha=pc_alpha)
+                        
+                        # Mark non-significant (independent) parents for removal
+                        for idx, (val, pval) in enumerate(zip(stats, pvals)):
+                            if float(pval) > pc_alpha:  # Not significant = independent
+                                parents_to_remove.append(parent_list[idx])
+                                any_removed = True
+                    
+                    for parent in parents_to_remove:
+                        parents[j].discard(parent)
+                    
+                    if self.verbosity >= 2 and parents_to_remove:
+                        print(f"  Removed {len(parents_to_remove)} parents from X{j} (batch)")
+            else:
+                # Standard sequential testing for cond_dim > 0
+                for j in self.selected_variables:
+                    current_parents = list(parents_snapshot[j])
 
-                if len(current_parents) <= cond_dim:
-                    continue
+                    if len(current_parents) <= cond_dim:
+                        continue
 
-                # Test each parent
-                parents_to_remove = []
+                    # Test each parent
+                    parents_to_remove = []
 
-                for parent in current_parents:
-                    i, neg_tau = parent
-                    tau = -neg_tau
+                    for parent in current_parents:
+                        i, neg_tau = parent
+                        tau = -neg_tau
 
-                    # Get possible conditioning sets (subsets of other parents)
-                    other_parents = [p for p in current_parents if p != parent]
+                        # Get possible conditioning sets (subsets of other parents)
+                        other_parents = [p for p in current_parents if p != parent]
 
-                    # Test with subsets of size cond_dim
-                    if len(other_parents) >= cond_dim:
-                        is_independent = self._test_with_conditioning_subsets(
-                            i=i,
-                            j=j,
-                            tau=tau,
-                            other_parents=other_parents,
-                            cond_dim=cond_dim,
-                            pc_alpha=pc_alpha,
-                        )
+                        # Test with subsets of size cond_dim
+                        if len(other_parents) >= cond_dim:
+                            is_independent = self._test_with_conditioning_subsets(
+                                i=i,
+                                j=j,
+                                tau=tau,
+                                other_parents=other_parents,
+                                cond_dim=cond_dim,
+                                pc_alpha=pc_alpha,
+                                max_subsets=max_subsets,
+                            )
 
-                        if is_independent:
-                            parents_to_remove.append(parent)
-                            any_removed = True
+                            if is_independent:
+                                parents_to_remove.append(parent)
+                                any_removed = True
 
-                # Remove independent parents
-                for parent in parents_to_remove:
-                    parents[j].discard(parent)
+                    # Remove independent parents
+                    for parent in parents_to_remove:
+                        parents[j].discard(parent)
 
-                if self.verbosity >= 2 and parents_to_remove:
-                    print(f"  Removed {len(parents_to_remove)} parents from X{j}")
+                    if self.verbosity >= 2 and parents_to_remove:
+                        print(f"  Removed {len(parents_to_remove)} parents from X{j}")
 
             if not any_removed:
                 # No removals - algorithm converged
@@ -429,6 +496,7 @@ class PCMCI:
         other_parents: List[Tuple[int, int]],
         cond_dim: int,
         pc_alpha: float,
+        max_subsets: int = 100,
     ) -> bool:
         """
         Test if (i, -tau) is independent of j given subsets of other parents.
@@ -437,8 +505,15 @@ class PCMCI:
         
         Note: other_parents contains tuples of (var, -lag) where lag is stored
         as negative. We convert to positive lag for get_variable_pair_data.
+        
+        Parameters
+        ----------
+        max_subsets : int
+            Maximum number of conditioning subsets to test. For large parent
+            sets, randomly samples subsets instead of testing all C(n,k).
         """
         from itertools import combinations
+        import random
 
         if cond_dim == 0:
             # Unconditional test
@@ -446,9 +521,70 @@ class PCMCI:
             result = self.test.run(X, Y, None, alpha=pc_alpha)
             return not result.significant
 
-        # Test with all subsets of size cond_dim
-        for subset in combinations(other_parents, cond_dim):
-            # Convert (var, neg_lag) to (var, pos_lag) for data handler
+        # Generate subsets - limit to max_subsets for large conditioning sets
+        all_subsets = list(combinations(other_parents, cond_dim))
+        
+        if len(all_subsets) > max_subsets:
+            # Randomly sample subsets for efficiency
+            random.seed(i * 1000 + j * 100 + tau)  # Reproducible
+            subsets_to_test = random.sample(all_subsets, max_subsets)
+        else:
+            subsets_to_test = all_subsets
+
+        # Group subsets by the max lag in their conditioning set for batching
+        # (same max lag = same data length = can batch)
+        if hasattr(self.test, 'run_batch') and len(subsets_to_test) > 1:
+            subsets_by_max_lag: Dict[int, List] = {}
+            for subset in subsets_to_test:
+                max_lag_in_subset = max(-neg_lag for _, neg_lag in subset)
+                effective_max_lag = max(tau, max_lag_in_subset)
+                if effective_max_lag not in subsets_by_max_lag:
+                    subsets_by_max_lag[effective_max_lag] = []
+                subsets_by_max_lag[effective_max_lag].append(subset)
+            
+            # Process each group as a batch
+            for max_lag, subsets_group in subsets_by_max_lag.items():
+                if len(subsets_group) == 1:
+                    # Single subset - just run directly
+                    subset = subsets_group[0]
+                    condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
+                    X, Y, Z = self.datahandler.get_variable_pair_data(
+                        i, j, tau, condition_indices
+                    )
+                    result = self.test.run(X, Y, Z, alpha=pc_alpha)
+                    if not result.significant:
+                        return True
+                else:
+                    # Batch test all subsets in this group
+                    X_batch = []
+                    Y_batch = []
+                    Z_batch = []
+                    
+                    for subset in subsets_group:
+                        condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
+                        X, Y, Z = self.datahandler.get_variable_pair_data(
+                            i, j, tau, condition_indices
+                        )
+                        X_batch.append(X)
+                        Y_batch.append(Y)
+                        Z_batch.append(Z)
+                    
+                    # Stack into arrays
+                    X_arr = jnp.stack(X_batch, axis=0)
+                    Y_arr = jnp.stack(Y_batch, axis=0)
+                    Z_arr = jnp.stack(Z_batch, axis=0)
+                    
+                    # Run batch test
+                    stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr, alpha=pc_alpha)
+                    
+                    # Check if any are independent (p-value > alpha)
+                    if bool(jnp.any(pvals > pc_alpha)):
+                        return True
+            
+            return False
+        
+        # Fallback to sequential testing
+        for subset in subsets_to_test:
             condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
             X, Y, Z = self.datahandler.get_variable_pair_data(
                 i, j, tau, condition_indices
@@ -499,7 +635,7 @@ class PCMCI:
         Notes
         -----
         The MCI test for link (i, -tau) -> j conditions on:
-        - Parents(j) \ {(i, -tau)}: Parents of target excluding the tested link
+        - Parents(j) minus (i, -tau): Parents of target excluding tested link
         - Parents(i, -tau): Parents of source (shifted by tau)
         """
         if parents is None:
@@ -607,6 +743,8 @@ class PCMCI:
         tau_max: int = 1,
         tau_min: int = 1,
         parents: Optional[Dict[int, Set[Tuple[int, int]]]] = None,
+        max_conds_py: Optional[int] = None,
+        max_conds_px: Optional[int] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         """
         Run MCI tests in parallel batches for maximum GPU utilization.
@@ -622,6 +760,10 @@ class PCMCI:
             Minimum time lag.
         parents : dict or None
             Parent sets from PC phase.
+        max_conds_py : int or None
+            Maximum conditions from target's parents.
+        max_conds_px : int or None
+            Maximum conditions from source's parents.
 
         Returns
         -------
@@ -642,8 +784,9 @@ class PCMCI:
         val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
         pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
 
-        # Group tests by conditioning set size for efficient batching
-        tests_by_cond_size: Dict[int, List[Tuple]] = {}
+        # Group tests by (n_conditions, max_lag) for proper batching
+        # Same n_cond AND same max_lag = same data shapes = can batch
+        tests_by_shape: Dict[Tuple[int, int], List[Tuple]] = {}
 
         for j in self.selected_variables:
             for i in range(self.N):
@@ -651,17 +794,32 @@ class PCMCI:
                     if tau == 0 and i == j:
                         continue
 
-                    cond_set = self._get_mci_conditions(i, j, tau, parents, None, None)
+                    cond_set = self._get_mci_conditions(
+                        i,
+                        j,
+                        tau,
+                        parents,
+                        max_conds_py,
+                        max_conds_px,
+                    )
                     n_cond = len(cond_set)
+                    
+                    # Compute max lag for this test
+                    if cond_set:
+                        max_cond_lag = max(lag for _, lag in cond_set)
+                        effective_max_lag = max(tau, max_cond_lag)
+                    else:
+                        effective_max_lag = tau
 
-                    if n_cond not in tests_by_cond_size:
-                        tests_by_cond_size[n_cond] = []
-                    tests_by_cond_size[n_cond].append((i, j, tau, cond_set))
+                    key = (n_cond, effective_max_lag)
+                    if key not in tests_by_shape:
+                        tests_by_shape[key] = []
+                    tests_by_shape[key].append((i, j, tau, cond_set))
 
         # Process each batch
-        for n_cond, tests in tests_by_cond_size.items():
+        for (n_cond, max_lag), tests in tests_by_shape.items():
             if self.verbosity >= 2:
-                print(f"Processing {len(tests)} tests with {n_cond} conditions")
+                print(f"Processing {len(tests)} tests with {n_cond} conditions, max_lag={max_lag}")
 
             if len(tests) == 0:
                 continue

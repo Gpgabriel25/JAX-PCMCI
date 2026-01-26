@@ -43,7 +43,7 @@ pip install jax-pcmci[tpu]
 ### From Source
 
 ```bash
-git clone https://github.com/your-org/jax-pcmci.git
+git clone https://github.com/gpgabriel25/jax-pcmci.git
 cd jax-pcmci
 pip install -e ".[dev]"
 ```

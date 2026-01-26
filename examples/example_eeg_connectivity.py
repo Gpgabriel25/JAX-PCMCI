@@ -200,11 +200,12 @@ def main():
     print(f"\nDevice: {info['default_backend']}")
     print(f"GPUs: {info['gpu_count']}")
     
-    # Parameters
-    n_channels = 64
+    # Parameters - Use 32 channels for stress test
+    # For larger networks, consider reducing tau_max or max_conds_dim
+    n_channels = 32
     n_samples = 1000  # ~4 seconds at 256 Hz
     tau_max = 3
-    n_true_connections = 20
+    n_true_connections = 15
     
     print(f"\nConfiguration:")
     print(f"  Channels: {n_channels}")
@@ -243,10 +244,11 @@ def main():
     results = pcmci.run(
         tau_max=tau_max,
         tau_min=1,
-        pc_alpha=0.01,  # Stricter for many tests
-        alpha_level=0.001,  # Very strict for FDR
+        pc_alpha=0.05,
+        alpha_level=0.01,
         fdr_method='fdr_bh',  # Benjamini-Hochberg
         max_conds_dim=2,  # Limit conditioning set size for speed
+        max_subsets=50,  # Limit subset testing
     )
     elapsed = time.perf_counter() - start
     

@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.scipy.special import digamma
+from jax.scipy.stats import chi2
 
 from jax_pcmci.independence_tests.base import CondIndTest
 from jax_pcmci.config import get_config
@@ -57,12 +58,13 @@ class CMIKnn(CondIndTest):
     k : int, default=10
         Number of nearest neighbors for CMI estimation.
         Higher k gives lower variance but higher bias.
-    significance : str, default='permutation'
+    significance : str, default='analytic'
         Method for computing p-values:
-        - 'permutation': Recommended for CMI
-        - 'shuffle_neighbors': Faster but less accurate
-    n_permutations : int, default=500
-        Number of permutations for significance testing.
+        - 'analytic': Fast chi-squared approximation (default)
+        - 'permutation': Recommended for highest accuracy
+    n_permutations : int, default=200
+        Number of permutations for significance testing (only used when
+        significance='permutation').
     alpha : float, default=0.05
         Significance level.
     metric : str, default='chebyshev'
@@ -124,8 +126,8 @@ class CMIKnn(CondIndTest):
     def __init__(
         self,
         k: int = 10,
-        significance: str = "permutation",
-        n_permutations: int = 500,
+        significance: str = "analytic",
+        n_permutations: int = 200,
         alpha: float = 0.05,
         metric: str = "chebyshev",
         standardize: bool = True,
@@ -174,25 +176,23 @@ class CMIKnn(CondIndTest):
         Y = jnp.asarray(Y, dtype=dtype).reshape(-1, 1)
 
         if Z is None:
-            # Mutual information (no conditioning)
-            return self._compute_mi(X, Y)
-        else:
-            Z = jnp.asarray(Z, dtype=dtype)
-            if Z.ndim == 1:
-                Z = Z.reshape(-1, 1)
-            return self._compute_cmi(X, Y, Z)
+            X_prep, Y_prep, _ = self._prepare_inputs(X, Y, None)
+            return self._compute_mi_standardized(X_prep, Y_prep)
 
-    def _compute_mi(self, X: jax.Array, Y: jax.Array) -> jax.Array:
+        Z_arr = jnp.asarray(Z, dtype=dtype)
+        if Z_arr.ndim == 1:
+            Z_arr = Z_arr.reshape(-1, 1)
+        X_prep, Y_prep, Z_prep = self._prepare_inputs(X, Y, Z_arr)
+        return self._compute_cmi_standardized(X_prep, Y_prep, Z_prep)
+
+    def _compute_mi_standardized(self, X: jax.Array, Y: jax.Array) -> jax.Array:
         """
         Compute Mutual Information I(X; Y) using KSG estimator.
+
+        Inputs are assumed to be pre-processed (dtype/shape/optional standardization).
         """
         n = X.shape[0]
         k = min(self.k, n - 1)
-
-        # Standardize if requested
-        if self.standardize:
-            X = (X - jnp.mean(X, axis=0)) / (jnp.std(X, axis=0) + 1e-10)
-            Y = (Y - jnp.mean(Y, axis=0)) / (jnp.std(Y, axis=0) + 1e-10)
 
         # Joint space XY
         XY = jnp.concatenate([X, Y], axis=1)
@@ -209,25 +209,18 @@ class CMIKnn(CondIndTest):
 
         return jnp.maximum(mi, 0.0)
 
-    def _compute_cmi(
+    def _compute_cmi_standardized(
         self, X: jax.Array, Y: jax.Array, Z: jax.Array
     ) -> jax.Array:
         """
         Compute Conditional Mutual Information I(X; Y | Z).
 
+        Inputs are assumed to be pre-processed (dtype/shape/optional standardization).
         Uses the Frenzel-Pompe estimator:
             I(X; Y | Z) = ψ(k) - <ψ(n_XZ + 1) + ψ(n_YZ + 1) - ψ(n_Z + 1)>
-
-        where n_XZ, n_YZ, n_Z are neighbor counts in subspaces.
         """
         n = X.shape[0]
         k = min(self.k, n - 1)
-
-        # Standardize if requested
-        if self.standardize:
-            X = (X - jnp.mean(X, axis=0)) / (jnp.std(X, axis=0) + 1e-10)
-            Y = (Y - jnp.mean(Y, axis=0)) / (jnp.std(Y, axis=0) + 1e-10)
-            Z = (Z - jnp.mean(Z, axis=0)) / (jnp.std(Z, axis=0) + 1e-10)
 
         # Build spaces
         XZ = jnp.concatenate([X, Z], axis=1)
@@ -267,9 +260,9 @@ class CMIKnn(CondIndTest):
         # Set self-distance to infinity
         distances = distances + jnp.eye(n) * jnp.inf
 
-        # Sort and get k-th neighbor (0-indexed, so k-1 after sorting)
-        sorted_distances = jnp.sort(distances, axis=1)
-        kth_distances = sorted_distances[:, k - 1]
+        # Get k-th neighbor without a full sort (much faster than sort)
+        # (0-indexed, so k-1)
+        kth_distances = jnp.partition(distances, k - 1, axis=1)[:, k - 1]
 
         return kth_distances
 
@@ -314,7 +307,40 @@ class CMIKnn(CondIndTest):
         distances_sq = XX[:, None] + YY[None, :] - 2 * XY
         return jnp.sqrt(jnp.maximum(distances_sq, 0.0))
 
-    @partial(jax.jit, static_argnums=(0, 2, 3))
+    @staticmethod
+    def _chebyshev_distances_chunked(
+        X: jax.Array, Y: jax.Array, chunk_size: int = 256
+    ) -> jax.Array:
+        """
+        Compute Chebyshev distances in chunks for memory efficiency.
+        
+        For large n, the full n×n distance matrix can exceed GPU memory.
+        This computes distances in chunks to reduce peak memory usage.
+        """
+        n = X.shape[0]
+        m = Y.shape[0]
+        
+        # Initialize output
+        distances = jnp.zeros((n, m), dtype=X.dtype)
+        
+        # Process in chunks
+        for i_start in range(0, n, chunk_size):
+            i_end = min(i_start + chunk_size, n)
+            X_chunk = X[i_start:i_end]
+            
+            for j_start in range(0, m, chunk_size):
+                j_end = min(j_start + chunk_size, m)
+                Y_chunk = Y[j_start:j_end]
+                
+                # Compute chunk distances
+                chunk_dist = jnp.max(
+                    jnp.abs(X_chunk[:, None, :] - Y_chunk[None, :, :]), axis=2
+                )
+                distances = distances.at[i_start:i_end, j_start:j_end].set(chunk_dist)
+        
+        return distances
+
+    @partial(jax.jit, static_argnums=(0,))
     def compute_pvalue(
         self, statistic: jax.Array, n_samples: int, n_conditions: int
     ) -> jax.Array:
@@ -342,8 +368,6 @@ class CMIKnn(CondIndTest):
         # For CMI, we typically need permutation testing
         # This is a rough approximation based on chi-squared null
         # Under H0, 2*n*CMI ~ chi^2(1) approximately
-        from jax.scipy.stats import chi2
-
         chi2_stat = 2 * n_samples * statistic
         pvalue = 1.0 - chi2.cdf(chi2_stat, df=1)
 
@@ -353,6 +377,57 @@ class CMIKnn(CondIndTest):
         return (
             f"CMIKnn(k={self.k}, significance='{self.significance}', "
             f"alpha={self.alpha}, metric='{self.metric}')"
+        )
+
+    # ----- Overrides for permutation/bootstrap hooks ------------------------
+
+    def _prepare_inputs(
+        self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array]
+    ) -> Tuple[jax.Array, jax.Array, Optional[jax.Array]]:
+        dtype = get_config().dtype
+        X_arr = jnp.asarray(X, dtype=dtype).reshape(-1, 1)
+        Y_arr = jnp.asarray(Y, dtype=dtype).reshape(-1, 1)
+
+        if Z is None:
+            if self.standardize:
+                X_arr, Y_arr = self._standardize_pair(X_arr, Y_arr)
+            return X_arr, Y_arr, None
+
+        Z_arr = jnp.asarray(Z, dtype=dtype)
+        if Z_arr.ndim == 1:
+            Z_arr = Z_arr.reshape(-1, 1)
+
+        if self.standardize:
+            X_arr, Y_arr, Z_arr = self._standardize_triplet(X_arr, Y_arr, Z_arr)
+
+        return X_arr, Y_arr, Z_arr
+
+    def _statistic_from_prepared(
+        self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array]
+    ) -> jax.Array:
+        if Z is None:
+            return self._compute_mi_standardized(X, Y)
+        return self._compute_cmi_standardized(X, Y, Z)
+
+    # ----- Standardization helpers ------------------------------------------
+
+    def _standardize_array(self, arr: jax.Array) -> jax.Array:
+        mean = jnp.mean(arr, axis=0)
+        std = jnp.std(arr, axis=0) + 1e-10
+        return (arr - mean) / std
+
+    def _standardize_pair(
+        self, X: jax.Array, Y: jax.Array
+    ) -> Tuple[jax.Array, jax.Array]:
+        return self._standardize_array(X), self._standardize_array(Y)
+
+    def _standardize_triplet(
+        self, X: jax.Array, Y: jax.Array, Z: jax.Array
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        return (
+            self._standardize_array(X),
+            self._standardize_array(Y),
+            self._standardize_array(Z),
         )
 
 
@@ -534,15 +609,13 @@ class CMISymbolic(CondIndTest):
 
         return H_XYZ - H_Z
 
-    @partial(jax.jit, static_argnums=(0, 2, 3))
+    @partial(jax.jit, static_argnums=(0,))
     def compute_pvalue(
         self, statistic: jax.Array, n_samples: int, n_conditions: int
     ) -> jax.Array:
         """
         Compute p-value using chi-squared approximation.
         """
-        from jax.scipy.stats import chi2
-
         # Under H0, 2*n*CMI ~ chi^2(df) where df depends on dimensions
         df = (self.n_symbols - 1) ** 2
         chi2_stat = 2 * n_samples * statistic

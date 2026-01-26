@@ -88,6 +88,20 @@ class TestDataHandler:
 
 class TestPCMCI:
     """Tests for PCMCI algorithm."""
+
+    class _FakeBatchTest:
+        """Minimal test double to capture batch conditioning sets."""
+
+        name = "Fake"
+
+        def run_batch(self, X_batch, Y_batch, Z_batch=None, alpha=None):
+            # Store last Z_batch passed for assertions
+            self.last_z_batch = Z_batch
+            n = X_batch.shape[0]
+            # Return zero statistics/pvalues of correct shape
+            stats = jnp.zeros((n,))
+            pvals = jnp.ones((n,))
+            return stats, pvals
     
     def test_basic_run(self):
         """Test basic PCMCI execution."""
@@ -143,6 +157,33 @@ class TestPCMCI:
         
         # Stricter alpha should find fewer or equal links
         assert results_strict.n_significant_links <= results_loose.n_significant_links
+
+    def test_batch_mci_respects_condition_limits(self):
+        """Batch MCI should honor max_conds_py/px limits."""
+        # Simple data; exact values don't matter for this structural test
+        data = jnp.arange(20, dtype=float).reshape(10, 2)
+        handler = DataHandler(data, normalize=False)
+
+        fake_test = self._FakeBatchTest()
+        pcmci = PCMCI(handler, cond_ind_test=fake_test, verbosity=0)
+
+        # Construct parents with one parent each direction at tau=1
+        parents = {
+            0: {(1, -1)},
+            1: {(0, -1)},
+        }
+
+        # Run batch MCI with zero conditioning limits
+        pcmci.run_batch_mci(
+            tau_max=1,
+            tau_min=1,
+            parents=parents,
+            max_conds_py=0,
+            max_conds_px=0,
+        )
+
+        # With both limits zero, conditioning sets should be empty => Z_batch is None
+        assert getattr(fake_test, "last_z_batch", None) is None
 
 
 class TestPCMCIPlus:

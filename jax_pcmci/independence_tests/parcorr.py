@@ -240,7 +240,7 @@ class ParCorr(CondIndTest):
 
         return residual
 
-    @partial(jax.jit, static_argnums=(0, 2, 3))
+    @partial(jax.jit, static_argnums=(0,))
     def compute_pvalue(
         self, statistic: jax.Array, n_samples: int, n_conditions: int
     ) -> jax.Array:
