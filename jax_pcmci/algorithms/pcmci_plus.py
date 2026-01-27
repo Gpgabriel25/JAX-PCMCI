@@ -223,6 +223,9 @@ class PCMCIPlus(PCMCI):
         if orientation_alpha is None:
             orientation_alpha = pc_alpha
 
+        # Precompute lagged data to avoid repeated construction
+        self.datahandler.precompute_lagged_data(tau_max)
+
         if self.verbosity >= 1:
             print(f"\n{'='*60}")
             print("PCMCI+: Contemporaneous and Lagged Causal Discovery")
@@ -586,35 +589,127 @@ class PCMCIPlus(PCMCI):
                     if oriented_graph[i, j, tau]:
                         parents[j].add((i, -tau))
 
-        # Run MCI tests
-        tests = []
-        for j in self.selected_variables:
-            for i in range(self.N):
-                for tau in range(tau_min, tau_max + 1):
-                    if tau == 0 and i == j:
-                        continue
-                    tests.append((i, j, tau))
+        # Run MCI tests (batched when available)
+        if hasattr(self.test, "run_batch"):
+            tests_by_shape: Dict[Tuple[int, int], List[Tuple]] = {}
 
-        if self.verbosity >= 1:
-            tests = tqdm(tests, desc="MCI+ tests", leave=False)
+            for j in self.selected_variables:
+                for i in range(self.N):
+                    for tau in range(tau_min, tau_max + 1):
+                        if tau == 0 and i == j:
+                            continue
 
-        for i, j, tau in tests:
-            # Get conditioning set
-            cond_set = self._get_mci_conditions(
-                i, j, tau, parents, max_conds_py, max_conds_px
-            )
+                        cond_set = self._get_mci_conditions(
+                            i, j, tau, parents, max_conds_py, max_conds_px
+                        )
+                        n_cond = len(cond_set)
 
-            # Run test
-            if cond_set:
-                X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, cond_set)
+                        if cond_set:
+                            max_cond_lag = max(lag for _, lag in cond_set)
+                            effective_max_lag = max(tau, max_cond_lag)
+                        else:
+                            effective_max_lag = tau
+
+                        key = (n_cond, effective_max_lag)
+                        if key not in tests_by_shape:
+                            tests_by_shape[key] = []
+                        tests_by_shape[key].append((i, j, tau, cond_set))
+
+            if self.verbosity >= 1:
+                iterable = tqdm(tests_by_shape.items(), desc="MCI+ batches", leave=False)
             else:
-                X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
-                Z = None
+                iterable = tests_by_shape.items()
 
-            result = self.test.run(X, Y, Z)
+            for (n_cond, max_lag), tests in iterable:
+                if len(tests) == 0:
+                    continue
 
-            val_matrix = val_matrix.at[i, j, tau].set(result.statistic)
-            pval_matrix = pval_matrix.at[i, j, tau].set(result.pvalue)
+                effective_T = self.T - max_lag
+                batch_size = self._get_effective_batch_size(
+                    n_samples=effective_T, n_conditions=n_cond
+                )
+                if batch_size is None:
+                    chunk_ranges = [(0, len(tests))]
+                else:
+                    chunk_ranges = [
+                        (start, min(start + batch_size, len(tests)))
+                        for start in range(0, len(tests), batch_size)
+                    ]
+
+                for start, end in chunk_ranges:
+                    test_indices = []
+                    i_list = []
+                    j_list = []
+                    tau_list = []
+                    cond_vars_list = [] if n_cond > 0 else None
+                    cond_lags_list = [] if n_cond > 0 else None
+
+                    for i, j, tau, cond_set in tests[start:end]:
+                        test_indices.append((i, j, tau))
+                        i_list.append(i)
+                        j_list.append(j)
+                        tau_list.append(tau)
+                        if n_cond > 0:
+                            cond_vars_list.append([var for var, _ in cond_set])
+                            cond_lags_list.append([lag for _, lag in cond_set])
+
+                    i_arr = jnp.asarray(i_list, dtype=jnp.int32)
+                    j_arr = jnp.asarray(j_list, dtype=jnp.int32)
+                    tau_arr = jnp.asarray(tau_list, dtype=jnp.int32)
+
+                    if n_cond > 0:
+                        cond_vars = jnp.asarray(cond_vars_list, dtype=jnp.int32)
+                        cond_lags = jnp.asarray(cond_lags_list, dtype=jnp.int32)
+                        X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
+                            i_arr,
+                            j_arr,
+                            tau_arr,
+                            cond_vars=cond_vars,
+                            cond_lags=cond_lags,
+                            max_lag=max_lag,
+                        )
+                    else:
+                        X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
+                            i_arr,
+                            j_arr,
+                            tau_arr,
+                            max_lag=max_lag,
+                        )
+
+                    stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr)
+
+                    i_arr = jnp.asarray([idx[0] for idx in test_indices], dtype=jnp.int32)
+                    j_arr = jnp.asarray([idx[1] for idx in test_indices], dtype=jnp.int32)
+                    tau_arr = jnp.asarray([idx[2] for idx in test_indices], dtype=jnp.int32)
+                    val_matrix = val_matrix.at[i_arr, j_arr, tau_arr].set(stats)
+                    pval_matrix = pval_matrix.at[i_arr, j_arr, tau_arr].set(pvals)
+        else:
+            tests = []
+            for j in self.selected_variables:
+                for i in range(self.N):
+                    for tau in range(tau_min, tau_max + 1):
+                        if tau == 0 and i == j:
+                            continue
+                        tests.append((i, j, tau))
+
+            if self.verbosity >= 1:
+                tests = tqdm(tests, desc="MCI+ tests", leave=False)
+
+            for i, j, tau in tests:
+                cond_set = self._get_mci_conditions(
+                    i, j, tau, parents, max_conds_py, max_conds_px
+                )
+
+                if cond_set:
+                    X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, cond_set)
+                else:
+                    X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
+                    Z = None
+
+                result = self.test.run(X, Y, Z)
+
+                val_matrix = val_matrix.at[i, j, tau].set(result.statistic)
+                pval_matrix = pval_matrix.at[i, j, tau].set(result.pvalue)
 
         return val_matrix, pval_matrix
 

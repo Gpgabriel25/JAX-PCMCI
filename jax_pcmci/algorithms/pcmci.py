@@ -340,6 +340,9 @@ class PCMCI:
         if tau_min < 0:
             raise ValueError(f"tau_min must be non-negative, got {tau_min}")
 
+        # Precompute lagged data to avoid repeated construction
+        self.datahandler.precompute_lagged_data(tau_max)
+
         # Initialize result matrices
         self._val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
         self._pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
