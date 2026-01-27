@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: jax-pcmci
-Version: 1.0.0
+Version: 1.1.0
 Summary: High-performance causal discovery using PCMCI algorithms with JAX acceleration
 Author: JAX-PCMCI Contributors
 License: MIT
