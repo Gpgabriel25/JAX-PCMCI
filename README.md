@@ -8,6 +8,8 @@
 
 Author's note: Hello, what brings you to this program? If you are here, I would love to hear your thoughts on this library and how you are using it. Just send me an email anytime. If you have any issues with it, please open an issue, or just tell me. I will likely get it fixed somewhat quickly.
 
+Also, side note. A lot of the performance is based off of the parameters. So changes like batch size, tau, precision, or any other parameters can make a huge difference to speed.
+
 JAX-PCMCI is a library for causal discovery from time series data, implementing the PCMCI family of algorithms with GPU/TPU acceleration through JAX. It provides significant speedups over CPU-based implementations while maintaining scientific rigor.
 
 ## Key Features

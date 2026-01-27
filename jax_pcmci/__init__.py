@@ -39,7 +39,7 @@ For more examples and detailed documentation, visit:
 https://jax-pcmci.readthedocs.io
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "JAX-PCMCI Contributors"
 
 # Core imports
