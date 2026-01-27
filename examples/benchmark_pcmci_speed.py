@@ -99,11 +99,12 @@ def time_run(label: str, fn) -> float:
 
 def main() -> None:
     t = _env_int("PCMCI_SPEED_T", 1000)
-    n = _env_int("PCMCI_SPEED_N", 10)
-    tau_max = _env_int("PCMCI_SPEED_TAU_MAX", 2)
+    n = _env_int("PCMCI_SPEED_N", 100)
+    tau_max = _env_int("PCMCI_SPEED_TAU_MAX", 1)
     pc_alpha = _env_float("PCMCI_SPEED_PC_ALPHA", 0.05)
     alpha_level = _env_float("PCMCI_SPEED_ALPHA_LEVEL", 0.05)
     do_warmup = _env_bool("PCMCI_SPEED_WARMUP", True)
+    max_conds_dim = _env_int("MAX_CONDS_DIM", 0)
 
     device = os.environ.get("PCMCI_SPEED_DEVICE", "auto")
     set_device(device)

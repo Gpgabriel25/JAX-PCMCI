@@ -48,6 +48,7 @@ from functools import partial
 from tqdm import tqdm
 from itertools import combinations
 import random
+import math
 
 from jax_pcmci.data import DataHandler
 from jax_pcmci.independence_tests.base import CondIndTest, TestResult
@@ -164,6 +165,41 @@ class PCMCI:
         self._parents: Dict[int, Set[Tuple[int, int]]] = {}
         self._pval_matrix: Optional[jax.Array] = None
         self._val_matrix: Optional[jax.Array] = None
+
+    def _sample_condition_subsets(
+        self,
+        items: List[Tuple[int, int]],
+        k: int,
+        max_subsets: int,
+        seed: int,
+    ) -> List[Tuple[Tuple[int, int], ...]]:
+        """
+        Reservoir-sample at most max_subsets k-sized combinations from items.
+
+        Falls back to full enumeration only when the total count is small
+        enough, avoiding large intermediate lists.
+        """
+        if k == 0:
+            return [tuple()]
+        if len(items) < k:
+            return []
+
+        total = math.comb(len(items), k)
+        if total <= max_subsets:
+            return list(combinations(items, k))
+
+        rng = random.Random(seed)
+        reservoir: List[Tuple[Tuple[int, int], ...]] = []
+
+        for idx, combo in enumerate(combinations(items, k)):
+            if idx < max_subsets:
+                reservoir.append(combo)
+            else:
+                j = rng.randint(0, idx)
+                if j < max_subsets:
+                    reservoir[j] = combo
+
+        return reservoir
 
     def _get_effective_batch_size(self, n_samples: Optional[int] = None, n_conditions: int = 0) -> Optional[int]:
         """
@@ -507,106 +543,92 @@ class PCMCI:
                     if self.verbosity >= 2 and parents_to_remove:
                         print(f"  Removed {len(parents_to_remove)} parents from X{j} (batch)")
             else:
-                # Cond_dim > 0: Optimize with batching across ALL parents/subsets
+                # Cond_dim > 0: Optimize with batching, but keep memory bounded
                 if hasattr(self.test, 'run_batch'):
-                    all_test_specs = []
-                    
-                    # 1. Collect all tests needed for this iteration
                     for j in self.selected_variables:
                         current_parents = list(parents_snapshot[j])
                         if len(current_parents) <= cond_dim:
                             continue
-                            
+
+                        specs_by_lag: Dict[int, List[Tuple[int, Tuple[int, int], int, Tuple[Tuple[int, int], ...]]]] = {}
+
                         for parent in current_parents:
                             i, neg_tau = parent
                             tau = -neg_tau
                             other_parents = [p for p in current_parents if p != parent]
-                            
-                            if len(other_parents) >= cond_dim:
-                                all_subsets = list(combinations(other_parents, cond_dim))
-                                if len(all_subsets) > max_subsets:
-                                    random.seed(i * 1000 + j * 100 + tau + cond_dim)
-                                    subsets_to_test = random.sample(all_subsets, max_subsets)
-                                else:
-                                    subsets_to_test = all_subsets
-                                    
-                                for subset in subsets_to_test:
-                                    all_test_specs.append((j, parent, tau, subset))
 
-                    # 2. Group by max_lag to optimize data slicing/padding
-                    specs_by_lag = {}
-                    for spec in all_test_specs:
-                        j, parent, tau, subset = spec
-                        # Max lag determines effective sample size and slicing
-                        max_lag_in_subset = 0
-                        if subset:
-                            max_lag_in_subset = max(-p[1] for p in subset)
-                        effective_max_lag = max(tau, max_lag_in_subset)
-                        
-                        if effective_max_lag not in specs_by_lag:
-                            specs_by_lag[effective_max_lag] = []
-                        specs_by_lag[effective_max_lag].append(spec)
+                            if len(other_parents) < cond_dim:
+                                continue
 
-                    # 3. Process batches
-                    for max_lag, specs in specs_by_lag.items():
-                        # Determine batch size based on memory
-                        effective_T = self.T - max_lag
-                        batch_size = self._get_effective_batch_size(n_samples=effective_T, n_conditions=cond_dim)
-                        
-                        if batch_size is None or batch_size > len(specs):
-                            chunk_ranges = [(0, len(specs))]
-                        else:
-                            chunk_ranges = [
-                                (start, min(start + batch_size, len(specs)))
-                                for start in range(0, len(specs), batch_size)
-                            ]
-                        
-                        for start, end in chunk_ranges:
-                            batch_specs = specs[start:end]
-                            
-                            # Prepare arrays for batch call
-                            batch_len = len(batch_specs)
-                            i_arr = jnp.zeros(batch_len, dtype=jnp.int32)
-                            j_arr = jnp.zeros(batch_len, dtype=jnp.int32)
-                            tau_arr = jnp.zeros(batch_len, dtype=jnp.int32)
-                            
-                            # Cond vars/lags: (Batch, CondDim)
-                            cond_vars = jnp.zeros((batch_len, cond_dim), dtype=jnp.int32)
-                            cond_lags = jnp.zeros((batch_len, cond_dim), dtype=jnp.int32)
-                            
-                            # Flatten specs into array inputs
-                            for idx, (j, parent, tau, subset) in enumerate(batch_specs):
-                                i_arr = i_arr.at[idx].set(parent[0])
-                                j_arr = j_arr.at[idx].set(j)
-                                tau_arr = tau_arr.at[idx].set(tau)
-                                
-                                # subset is list of (var, neg_lag)
-                                if subset:
+                            subsets_to_test = self._sample_condition_subsets(
+                                other_parents,
+                                cond_dim,
+                                max_subsets,
+                                seed=i * 1000 + j * 100 + tau + cond_dim,
+                            )
+
+                            for subset in subsets_to_test:
+                                max_lag_in_subset = max(-p[1] for p in subset) if subset else 0
+                                effective_max_lag = max(tau, max_lag_in_subset)
+                                if effective_max_lag not in specs_by_lag:
+                                    specs_by_lag[effective_max_lag] = []
+                                specs_by_lag[effective_max_lag].append((j, parent, tau, subset))
+
+                        for max_lag, specs in specs_by_lag.items():
+                            effective_T = self.T - max_lag
+                            batch_size = self._get_effective_batch_size(
+                                n_samples=effective_T, n_conditions=cond_dim
+                            )
+
+                            if batch_size is None or batch_size > len(specs):
+                                chunk_ranges = [(0, len(specs))]
+                            else:
+                                chunk_ranges = [
+                                    (start, min(start + batch_size, len(specs)))
+                                    for start in range(0, len(specs), batch_size)
+                                ]
+
+                            for start, end in chunk_ranges:
+                                batch_specs = specs[start:end]
+
+                                i_list = []
+                                j_list = []
+                                tau_list = []
+                                cond_vars_list = []
+                                cond_lags_list = []
+
+                                for j_idx, parent, tau, subset in batch_specs:
+                                    i_list.append(parent[0])
+                                    j_list.append(j_idx)
+                                    tau_list.append(tau)
+
                                     c_vars = [p[0] for p in subset]
                                     c_lags = [-p[1] for p in subset]
-                                    cond_vars = cond_vars.at[idx].set(jnp.array(c_vars, dtype=jnp.int32))
-                                    cond_lags = cond_lags.at[idx].set(jnp.array(c_lags, dtype=jnp.int32))
+                                    cond_vars_list.append(c_vars)
+                                    cond_lags_list.append(c_lags)
 
-                            # Get data
-                            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                                i_arr, j_arr, tau_arr, cond_vars, cond_lags, max_lag=max_lag
-                            )
-                            
-                            # Run tests
-                            stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
-                            
-                            # Process results
-                            # If pval > alpha, it's independent -> Remove parent
-                            for idx, pval in enumerate(pvals):
-                                if float(pval) > pc_alpha:
-                                    j_idx = batch_specs[idx][0]
-                                    p_idx = batch_specs[idx][1]
-                                    if p_idx in parents[j_idx]:
-                                        parents[j_idx].discard(p_idx)
-                                        any_removed = True
-                    
+                                i_arr = jnp.asarray(i_list, dtype=jnp.int32)
+                                j_arr = jnp.asarray(j_list, dtype=jnp.int32)
+                                tau_arr = jnp.asarray(tau_list, dtype=jnp.int32)
+                                cond_vars = jnp.asarray(cond_vars_list, dtype=jnp.int32)
+                                cond_lags = jnp.asarray(cond_lags_list, dtype=jnp.int32)
+
+                                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                                    i_arr, j_arr, tau_arr, cond_vars, cond_lags, max_lag=max_lag
+                                )
+
+                                stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
+
+                                for idx, pval in enumerate(pvals):
+                                    if float(pval) > pc_alpha:
+                                        j_idx = batch_specs[idx][0]
+                                        p_idx = batch_specs[idx][1]
+                                        if p_idx in parents[j_idx]:
+                                            parents[j_idx].discard(p_idx)
+                                            any_removed = True
+
                     if self.verbosity >= 2 and any_removed:
-                         print(f"  Batch removal completed for cond_dim {cond_dim}")
+                        print(f"  Batch removal completed for cond_dim {cond_dim}")
 
                 else:
                     # Sequential fallback
@@ -692,15 +714,12 @@ class PCMCI:
             result = self.test.run(X, Y, None, alpha=pc_alpha)
             return not result.significant
 
-        # Generate subsets - limit to max_subsets for large conditioning sets
-        all_subsets = list(combinations(other_parents, cond_dim))
-        
-        if len(all_subsets) > max_subsets:
-            # Randomly sample subsets for efficiency
-            random.seed(i * 1000 + j * 100 + tau)  # Reproducible
-            subsets_to_test = random.sample(all_subsets, max_subsets)
-        else:
-            subsets_to_test = all_subsets
+        subsets_to_test = self._sample_condition_subsets(
+            other_parents,
+            cond_dim,
+            max_subsets,
+            seed=i * 1000 + j * 100 + tau,
+        )
 
         # Group subsets by the max lag in their conditioning set for batching
         # (same max lag = same data length = can batch)
