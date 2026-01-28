@@ -256,15 +256,17 @@ class PCMCI:
                     
                     if bytes_per_test > 0:
                         computed_batch = max(64, int(available / bytes_per_test))
-                        batch = min(computed_batch, 4096)  # Cap at reasonable max
+                        batch = min(computed_batch, 8192)  # Cap at reasonable max
                         self._batch_size_cache[cache_key] = batch
                         return batch
             except Exception:
-                pass  # Fall through to None
+                pass  # Fall through to default
 
-            self._batch_size_cache[cache_key] = None
+            # Default safe batch size if memory stats unavailable or failed
+            self._batch_size_cache[cache_key] = 4096
+            return 4096
         
-        return None
+        return 4096
 
     def run(
         self,
@@ -502,80 +504,38 @@ class PCMCI:
             parents_snapshot = {j: parents[j].copy() for j in self.selected_variables}
             any_removed = False
 
-            # For cond_dim=0, use batch testing for efficiency
-            if cond_dim == 0 and hasattr(self.test, 'run_batch'):
+            # Check if we can use batch optimization
+            if hasattr(self.test, 'run_batch'):
+                # Global batching: collect tests from ALL variables first
+                # specs_by_lag stores: (j, parent, tau, subset)
+                specs_by_lag: Dict[int, List[Tuple[int, Tuple[int, int], int, Tuple[Tuple[int, int], ...]]]] = {}
+
                 for j in self.selected_variables:
                     current_parents = list(parents_snapshot[j])
                     if not current_parents:
                         continue
-                    
-                    # Group parents by lag (same lag = same data length)
-                    parents_by_lag: Dict[int, List[Tuple[int, int]]] = {}
-                    for parent in current_parents:
-                        i, neg_tau = parent
-                        tau = -neg_tau
-                        if tau not in parents_by_lag:
-                            parents_by_lag[tau] = []
-                        parents_by_lag[tau].append(parent)
-                    
-                    parents_to_remove = []
-                    
-                    # Process each lag group in memory-aware batches
-                    # Estimate n_samples for this tau
-                    effective_T = self.T - max(parents_by_lag.keys())
-                    batch_size = self._get_effective_batch_size(n_samples=effective_T, n_conditions=0)
-                    for tau, parents_with_tau in parents_by_lag.items():
-                        if batch_size is None:
-                            chunk_ranges = [(0, len(parents_with_tau))]
-                        else:
-                            chunk_ranges = [
-                                (start, min(start + batch_size, len(parents_with_tau)))
-                                for start in range(0, len(parents_with_tau), batch_size)
-                            ]
 
-                        for start, end in chunk_ranges:
-                            parent_list = parents_with_tau[start:end]
-                            
-                            i_arr = jnp.asarray([p[0] for p in parent_list], dtype=jnp.int32)
-                            j_arr = jnp.full((len(parent_list),), j, dtype=jnp.int32)
-                            tau_arr = jnp.full((len(parent_list),), tau, dtype=jnp.int32)
-                            X_batch, Y_batch, _ = self.datahandler.get_variable_pair_batch(
-                                i_arr,
-                                j_arr,
-                                tau_arr,
-                                max_lag=tau,
-                            )
-                            
-                            # Run batch test for this lag group chunk
-                            stats, pvals = self.test.run_batch(X_batch, Y_batch, None, alpha=pc_alpha)
-                            
-                            # Mark non-significant (independent) parents for removal
-                            # Vectorized check: find indices where pvalue > pc_alpha
-                            independent_mask = np.asarray(pvals > pc_alpha)
-                            for idx in np.where(independent_mask)[0]:
-                                parents_to_remove.append(parent_list[idx])
-                                any_removed = True
-                    
-                    for parent in parents_to_remove:
-                        parents[j].discard(parent)
-                    
-                    if self.verbosity >= 2 and parents_to_remove:
-                        print(f"  Removed {len(parents_to_remove)} parents from X{j} (batch)")
-            else:
-                # Cond_dim > 0: Optimize with batching, but keep memory bounded
-                if hasattr(self.test, 'run_batch'):
-                    for j in self.selected_variables:
-                        current_parents = list(parents_snapshot[j])
-                        if len(current_parents) <= cond_dim:
-                            continue
-
-                        specs_by_lag: Dict[int, List[Tuple[int, Tuple[int, int], int, Tuple[Tuple[int, int], ...]]]] = {}
-
+                    if cond_dim == 0:
+                        # Unconditional optimization
                         for parent in current_parents:
                             i, neg_tau = parent
                             tau = -neg_tau
+                            
+                            if tau not in specs_by_lag:
+                                specs_by_lag[tau] = []
+                            # Empty subset for cond_dim=0
+                            specs_by_lag[tau].append((j, parent, tau, tuple()))
+                    
+                    else:
+                        # Conditional optimization
+                        if len(current_parents) <= cond_dim:
+                            continue
+                            
+                        for parent in current_parents:
+                            i, neg_tau = parent
+                            tau = -neg_tau
+                            
                             other_parents = [p for p in current_parents if p != parent]
-
                             if len(other_parents) < cond_dim:
                                 continue
 
@@ -593,56 +553,71 @@ class PCMCI:
                                     specs_by_lag[effective_max_lag] = []
                                 specs_by_lag[effective_max_lag].append((j, parent, tau, subset))
 
-                        for max_lag, specs in specs_by_lag.items():
-                            effective_T = self.T - max_lag
-                            batch_size = self._get_effective_batch_size(
-                                n_samples=effective_T, n_conditions=cond_dim
+                # Now run all collected tests in optimal batches
+                parents_to_remove_global = set() # Store (j, parent) tuples
+                
+                sorted_lags = sorted(specs_by_lag.keys())
+                for max_lag in sorted_lags:
+                    specs = specs_by_lag[max_lag]
+                    
+                    effective_T = self.T - max_lag
+                    batch_size = self._get_effective_batch_size(
+                        n_samples=effective_T, n_conditions=cond_dim
+                    )
+
+                    if batch_size is None or batch_size > len(specs):
+                        chunk_ranges = [(0, len(specs))]
+                    else:
+                        chunk_ranges = [
+                            (start, min(start + batch_size, len(specs)))
+                            for start in range(0, len(specs), batch_size)
+                        ]
+
+                    for start, end in chunk_ranges:
+                        batch_specs = specs[start:end]
+                        
+                        # Optimized unpacking
+                        j_list, parent_tuples, tau_list, subset_tuples = zip(*batch_specs)
+                        i_list = [p[0] for p in parent_tuples]
+                        
+                        i_arr = jnp.array(i_list, dtype=jnp.int32)
+                        j_arr = jnp.array(j_list, dtype=jnp.int32)
+                        tau_arr = jnp.array(tau_list, dtype=jnp.int32)
+                        
+                        if cond_dim > 0:
+                            # Shape: (batch, cond_dim, 2)
+                            subset_arr = np.array(subset_tuples, dtype=np.int32)
+                            cond_vars = jnp.array(subset_arr[:, :, 0], dtype=jnp.int32)
+                            cond_lags = jnp.array(-subset_arr[:, :, 1], dtype=jnp.int32)
+                            
+                            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                                i_arr, j_arr, tau_arr, cond_vars, cond_lags, max_lag=max_lag
+                            )
+                        else:
+                            # Cond_dim = 0
+                            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                                i_arr, j_arr, tau_arr, max_lag=max_lag
                             )
 
-                            if batch_size is None or batch_size > len(specs):
-                                chunk_ranges = [(0, len(specs))]
-                            else:
-                                chunk_ranges = [
-                                    (start, min(start + batch_size, len(specs)))
-                                    for start in range(0, len(specs), batch_size)
-                                ]
+                        stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
 
-                            for start, end in chunk_ranges:
-                                batch_specs = specs[start:end]
-                                
-                                # Optimized unpacking using zip and numpy
-                                j_list, parent_tuples, tau_list, subset_tuples = zip(*batch_specs)
-                                i_list = [p[0] for p in parent_tuples]
-                                
-                                i_arr = jnp.array(i_list, dtype=jnp.int32)
-                                j_arr = jnp.array(j_list, dtype=jnp.int32)
-                                tau_arr = jnp.array(tau_list, dtype=jnp.int32)
-                                
-                                # Convert subsets (tuples of (var, -lag)) to array
-                                # Shape: (batch, cond_dim, 2)
-                                subset_arr = np.array(subset_tuples, dtype=np.int32)
-                                cond_vars = jnp.array(subset_arr[:, :, 0], dtype=jnp.int32)
-                                cond_lags = jnp.array(-subset_arr[:, :, 1], dtype=jnp.int32)
+                        # Check for independence
+                        independent_mask = np.asarray(pvals > pc_alpha)
+                        for idx in np.where(independent_mask)[0]:
+                            j_idx = batch_specs[idx][0]
+                            p_idx = batch_specs[idx][1]
+                            parents_to_remove_global.add((j_idx, p_idx))
+                            any_removed = True
+                
+                # Apply removals
+                for j_idx, p_idx in parents_to_remove_global:
+                    parents[j_idx].discard(p_idx)
+                
+                if self.verbosity >= 2 and parents_to_remove_global:
+                    print(f"  Removed {len(parents_to_remove_global)} parents across all variables (cond_dim={cond_dim})")
 
-                                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                                    i_arr, j_arr, tau_arr, cond_vars, cond_lags, max_lag=max_lag
-                                )
-
-                                stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
-
-                                # Vectorized: find independent pairs (pvalue > alpha)
-                                independent_mask = np.asarray(pvals > pc_alpha)
-                                for idx in np.where(independent_mask)[0]:
-                                    j_idx = batch_specs[idx][0]
-                                    p_idx = batch_specs[idx][1]
-                                    if p_idx in parents[j_idx]:
-                                        parents[j_idx].discard(p_idx)
-                                        any_removed = True
-
-                    if self.verbosity >= 2 and any_removed:
-                        print(f"  Batch removal completed for cond_dim {cond_dim}")
-
-                else:
+            else:
+                # Sequential fallback (CPU/No-batch-support)
                     # Sequential fallback
                     for j in self.selected_variables:
                         current_parents = list(parents_snapshot[j])

@@ -170,6 +170,7 @@ class PCMCIPlus(PCMCI):
         max_conds_dim: Optional[int] = None,
         max_conds_py: Optional[int] = None,
         max_conds_px: Optional[int] = None,
+        max_subsets: int = 100,
         alpha_level: float = 0.05,
         fdr_method: Optional[str] = None,
         orientation_alpha: Optional[float] = None,
@@ -198,6 +199,8 @@ class PCMCIPlus(PCMCI):
             Maximum conditions from target's parents.
         max_conds_px : int or None
             Maximum conditions from source's parents.
+        max_subsets : int, default=100
+            Maximum number of conditioning subsets to test per parent in PC phase.
         alpha_level : float, default=0.05
             Final significance level for link discovery.
         fdr_method : str or None
@@ -245,6 +248,7 @@ class PCMCIPlus(PCMCI):
             tau_min=tau_min,
             pc_alpha=pc_alpha,
             max_conds_dim=max_conds_dim,
+            max_subsets=max_subsets,
         )
 
         # Phase 2: Orientation
@@ -298,6 +302,7 @@ class PCMCIPlus(PCMCI):
         tau_min: int,
         pc_alpha: float,
         max_conds_dim: Optional[int],
+        max_subsets: int = 100,
     ) -> Tuple[Dict[int, Set[Tuple[int, int]]], Dict]:
         """
         Discover the skeleton (undirected graph) using PC-stable.
@@ -393,10 +398,16 @@ class PCMCIPlus(PCMCI):
                             if len(other_adj) < cond_dim:
                                 continue
 
-                            # Test with ALL subsets of size cond_dim (PC-stable standard)
-                            # Note: For very large sets, this could explode, but typical PCMCI usage involves
-                            # sparse graphs or limited max_conds_dim.
-                            for subset in combinations(other_adj, cond_dim):
+                            # Test with subsets of size cond_dim
+                            # Use reservoir sampling to limit combinatorial explosion
+                            subsets_to_test = self._sample_condition_subsets(
+                                other_adj,
+                                cond_dim,
+                                max_subsets,
+                                seed=i * 1000 + j * 100 + tau + cond_dim,
+                            )
+                            
+                            for subset in subsets_to_test:
                                 max_lag_in_subset = max(-p[1] for p in subset) if subset else 0
                                 effective_max_lag = max(tau, max_lag_in_subset)
                                 if effective_max_lag not in specs_by_lag:
@@ -477,6 +488,7 @@ class PCMCIPlus(PCMCI):
                                 other_adj=other_adj,
                                 cond_dim=cond_dim,
                                 pc_alpha=pc_alpha,
+                                max_subsets=max_subsets,
                             )
 
                             if independent:
@@ -508,6 +520,7 @@ class PCMCIPlus(PCMCI):
         other_adj: List[Tuple[int, int]],
         cond_dim: int,
         pc_alpha: float,
+        max_subsets: int = 100,
     ) -> Tuple[bool, Set[Tuple[int, int]]]:
         """
         Test independence with conditioning subsets.
@@ -524,7 +537,14 @@ class PCMCIPlus(PCMCI):
                 return True, set()
             return False, set()
 
-        for subset in combinations(other_adj, cond_dim):
+        subsets_to_test = self._sample_condition_subsets(
+            other_adj,
+            cond_dim,
+            max_subsets,
+            seed=i * 1000 + j * 100 + tau,
+        )
+
+        for subset in subsets_to_test:
             # Convert (var, neg_tau) to (var, pos_tau) for data handler
             cond_list = [(var, -neg_tau) for var, neg_tau in subset]
 
