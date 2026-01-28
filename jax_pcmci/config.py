@@ -165,7 +165,7 @@ class PCMCIConfig:
     progress_bar: bool = True
     verbosity: int = 1
     cache_results: bool = True
-    cache_max_entries: int = 4096
+    cache_max_entries: int = 8192
     gpu_preallocate: bool = True
     gpu_memory_fraction: Optional[float] = None
     gpu_allocator: Optional[str] = None

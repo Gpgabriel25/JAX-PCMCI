@@ -496,7 +496,8 @@ class PCMCI:
         
         # Prepare batched inputs
         n_links = i_flat.shape[0]
-        batch_size = 16  # Reduced to avoid OOM
+        # Use conservative batch size to avoid OOM - moderate improvement from 16 to 64
+        batch_size = 64
         n_batches = (n_links + batch_size - 1) // batch_size
         n_padded = n_batches * batch_size
         
@@ -591,9 +592,11 @@ class PCMCI:
         tau_max: int,
         max_cond_dim_limit: int,
     ) -> jax.Array:
-        """
-        Run PC tests for a single batch of links.
-        """
+        """Run PC tests for a batch of links with optimized data access."""
+        
+        # Pre-compute commonly used values
+        eff_T = data_values.shape[0] - tau_max
+        
         # Define the per-link test function
         def test_one_link(i, j, tau, key_in):
             is_active = mask[i, j, tau]
@@ -614,18 +617,19 @@ class PCMCI:
                 p = tp_flat.astype(jnp.float32)
                 sub_keys = jax.random.split(key_in, max_subsets)
                 
+                # Optimized: Use static limit for top_k
                 def get_subset(sk):
                     g = -jnp.log(-jnp.log(jax.random.uniform(sk, p.shape) + 1e-20))
                     sc = jnp.where(tp_flat, g, -1e9)
-                    effective_limit = max(1, max_cond_dim_limit)
-                    _, idxs = jax.lax.top_k(sc, effective_limit)
+                    # Use static limit for top_k
+                    _, idxs = jax.lax.top_k(sc, max_cond_dim_limit)
                     c_lags = idxs % (tau_max + 1)
                     c_vars = idxs // (tau_max + 1)
                     return c_vars, c_lags
 
                 c_vars_all, c_lags_all = jax.vmap(get_subset)(sub_keys)
                 
-                eff_T = data_values.shape[0] - tau_max
+                # Pre-compute X and Y once
                 start_x = tau_max - tau
                 X_vals = jax.lax.dynamic_slice(data_values, (start_x, i), (eff_T, 1)).squeeze(1)
                 X_rep = jnp.broadcast_to(X_vals, (max_subsets, eff_T))
@@ -643,7 +647,8 @@ class PCMCI:
                 
                 Z_rep = jax.vmap(get_Z_matrix)(c_vars_all, c_lags_all)
                 
-                limit_indices = jnp.arange(max(1, max_cond_dim_limit))
+                # Use masking (cond_dim is traced, can't use in slice shapes)
+                limit_indices = jnp.arange(max_cond_dim_limit)
                 col_mask = limit_indices < cond_dim
                 Z_masked = Z_rep * col_mask.reshape(1, 1, -1)
                 
@@ -659,12 +664,10 @@ class PCMCI:
                 can_test,
                 perform_test,
                 lambda k: jnp.float32(0.0) if get_config().dtype == jnp.float32 else 0.0,
-                keys[0]  # Valid key
+                key_in
             )
 
-
         # Use keys directly - they are already (batch_size, 2) from split
-        
         all_pvals = jax.vmap(test_one_link)(i_flat, j_flat, tau_flat, keys)
         return all_pvals
 
@@ -975,8 +978,8 @@ class PCMCI:
             pbar = tqdm(total=len(test_specs), desc="MCI Tests")
             
         for dim, specs in specs_by_dim.items():
-            # Create batches
-            batch_size = 4096 # Configurable
+            # Create batches - use conservative batch size to avoid OOM
+            batch_size = 2048  # Reasonable for most GPUs
             
             for k in range(0, len(specs), batch_size):
                 batch = specs[k:k+batch_size]
