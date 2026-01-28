@@ -171,18 +171,12 @@ class CMIKnn(CondIndTest):
         jax.Array
             CMI estimate (non-negative scalar).
         """
-        dtype = get_config().dtype
-        X = jnp.asarray(X, dtype=dtype).reshape(-1, 1)
-        Y = jnp.asarray(Y, dtype=dtype).reshape(-1, 1)
-
+        # Use _prepare_inputs which handles dtype conversion, reshaping, and standardization
         if Z is None:
             X_prep, Y_prep, _ = self._prepare_inputs(X, Y, None)
             return self._compute_mi_standardized(X_prep, Y_prep)
 
-        Z_arr = jnp.asarray(Z, dtype=dtype)
-        if Z_arr.ndim == 1:
-            Z_arr = Z_arr.reshape(-1, 1)
-        X_prep, Y_prep, Z_prep = self._prepare_inputs(X, Y, Z_arr)
+        X_prep, Y_prep, Z_prep = self._prepare_inputs(X, Y, Z)
         return self._compute_cmi_standardized(X_prep, Y_prep, Z_prep)
 
     def _compute_mi_standardized(self, X: jax.Array, Y: jax.Array) -> jax.Array:
@@ -221,24 +215,39 @@ class CMIKnn(CondIndTest):
         Inputs are assumed to be pre-processed (dtype/shape/optional standardization).
         Uses the Frenzel-Pompe estimator:
             I(X; Y | Z) = ψ(k) - <ψ(n_XZ + 1) + ψ(n_YZ + 1) - ψ(n_Z + 1)>
+        
+        Optimized: For Chebyshev metric, joint distances are max of component distances.
+        We compute X, Y, Z distances once and combine them efficiently.
         """
         n = X.shape[0]
         k = min(self.k, n - 1)
 
-        # Build spaces
-        XZ = jnp.concatenate([X, Z], axis=1)
-        YZ = jnp.concatenate([Y, Z], axis=1)
-        XYZ = jnp.concatenate([X, Y, Z], axis=1)
+        # For Chebyshev metric, d(XYZ) = max(d(X), d(Y), d(Z))
+        # This allows us to compute component distances once and reuse
+        if self.metric == "chebyshev":
+            # Compute component distances once
+            dist_X = self._chebyshev_distances(X, X)
+            dist_Y = self._chebyshev_distances(Y, Y)
+            dist_Z = self._chebyshev_distances(Z, Z)
+            
+            # Joint distances via max (Chebyshev property)
+            dist_XZ = jnp.maximum(dist_X, dist_Z)
+            dist_YZ = jnp.maximum(dist_Y, dist_Z)
+            dist_XYZ = jnp.maximum(dist_XZ, dist_Y)  # = max(X, Y, Z)
+        else:
+            # Euclidean: need to compute full joint spaces
+            XZ = jnp.concatenate([X, Z], axis=1)
+            YZ = jnp.concatenate([Y, Z], axis=1)
+            XYZ = jnp.concatenate([X, Y, Z], axis=1)
+            dist_XZ = self._euclidean_distances(XZ, XZ)
+            dist_YZ = self._euclidean_distances(YZ, YZ)
+            dist_XYZ = self._euclidean_distances(XYZ, XYZ)
+            dist_Z = self._euclidean_distances(Z, Z)
 
-        # Compute distances for joint space XYZ to find eps
-        dist_XYZ = self._compute_distances(XYZ)
+        # Find eps from joint space XYZ
         eps = self._kth_neighbor_from_dist(dist_XYZ, k)
 
-        # Compute distances for subspaces once and count neighbors
-        dist_XZ = self._compute_distances(XZ)
-        dist_YZ = self._compute_distances(YZ)
-        dist_Z = self._compute_distances(Z)
-
+        # Count neighbors in subspaces
         n_XZ = self._count_neighbors_from_dist(dist_XZ, eps)
         n_YZ = self._count_neighbors_from_dist(dist_YZ, eps)
         n_Z = self._count_neighbors_from_dist(dist_Z, eps)

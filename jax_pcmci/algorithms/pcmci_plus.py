@@ -365,12 +365,13 @@ class PCMCIPlus(PCMCI):
                         
                         stats, pvals = self.test.run_batch(X_batch, Y_batch, None, alpha=pc_alpha)
                         
-                        for idx, pval in enumerate(pvals):
-                            if float(pval) > pc_alpha:  # Independent
-                                edges_to_remove.append(edges_at_tau[idx])
-                                sepsets[(edges_at_tau[idx][0], j, tau)] = set()
-                                sepsets[(j, edges_at_tau[idx][0], -tau)] = set()
-                                any_removed = True
+                        # Vectorized: find independent edges (pvalue > alpha)
+                        independent_mask = np.asarray(pvals > pc_alpha)
+                        for idx in np.where(independent_mask)[0]:
+                            edges_to_remove.append(edges_at_tau[idx])
+                            sepsets[(edges_at_tau[idx][0], j, tau)] = set()
+                            sepsets[(j, edges_at_tau[idx][0], -tau)] = set()
+                            any_removed = True
                     
                     for edge in edges_to_remove:
                         skeleton[j].discard(edge)
@@ -437,19 +438,20 @@ class PCMCIPlus(PCMCI):
 
                             stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
 
-                            for idx, pval in enumerate(pvals):
-                                if float(pval) > pc_alpha:
-                                    j_idx = j_list[idx]
-                                    adj_edge = adj_edges[idx]
-                                    tau_val = tau_list[idx]
-                                    subset_val = subset_list[idx]
+                            # Vectorized: find independent pairs (pvalue > alpha)
+                            independent_mask = np.asarray(pvals > pc_alpha)
+                            for idx in np.where(independent_mask)[0]:
+                                j_idx = j_list[idx]
+                                adj_edge = adj_edges[idx]
+                                tau_val = tau_list[idx]
+                                subset_val = subset_list[idx]
 
-                                    if adj_edge in skeleton[j_idx]:
-                                        skeleton[j_idx].discard(adj_edge)
-                                        # Store separating set
-                                        sepsets[(adj_edge[0], j_idx, tau_val)] = set(subset_val)
-                                        sepsets[(j_idx, adj_edge[0], -tau_val)] = set(subset_val)
-                                        any_removed = True
+                                if adj_edge in skeleton[j_idx]:
+                                    skeleton[j_idx].discard(adj_edge)
+                                    # Store separating set
+                                    sepsets[(adj_edge[0], j_idx, tau_val)] = set(subset_val)
+                                    sepsets[(j_idx, adj_edge[0], -tau_val)] = set(subset_val)
+                                    any_removed = True
                 else:
                     # Original sequential code path fallback
                     for j in self.selected_variables:
@@ -595,8 +597,14 @@ class PCMCIPlus(PCMCI):
 
         If X - Z - Y (X and Y not adjacent) and Z not in sepset(X,Y),
         then X -> Z <- Y.
+        
+        Optimized: Collects all updates and applies them in batch.
         """
         N = self.N
+        
+        # Collect all v-structure updates to batch them
+        updates_arrow = []  # List of (i, j) to set as 2 (arrow)
+        updates_remove = []  # List of (i, j) to set as 0 (remove)
 
         for z in range(N):
             # Find all contemporaneous neighbors of z
@@ -624,14 +632,22 @@ class PCMCIPlus(PCMCI):
 
                         if not z_in_sepset:
                             # Orient as X -> Z <- Y (v-structure)
-                            graph = graph.at[x, z, 0].set(2)  # Arrow from x to z
-                            graph = graph.at[y, z, 0].set(2)  # Arrow from y to z
-                            # Remove circles in opposite direction
-                            graph = graph.at[z, x, 0].set(0)
-                            graph = graph.at[z, y, 0].set(0)
+                            updates_arrow.append((x, z))
+                            updates_arrow.append((y, z))
+                            updates_remove.append((z, x))
+                            updates_remove.append((z, y))
 
                             if self.verbosity >= 2:
                                 print(f"  V-structure: X{x} -> X{z} <- X{y}")
+
+        # Apply all updates using numpy for efficiency (avoid repeated .at[].set())
+        if updates_arrow or updates_remove:
+            graph_np = np.array(graph)
+            for i, j in updates_arrow:
+                graph_np[i, j, 0] = 2
+            for i, j in updates_remove:
+                graph_np[i, j, 0] = 0
+            graph = jnp.array(graph_np)
 
         return graph
 
@@ -650,40 +666,54 @@ class PCMCIPlus(PCMCI):
         R2: X -> Z -> Y and X - Y  =>  X -> Y
         R3: X - Z -> Y <- W - X  and X - Y  =>  X -> Y
         R4: X - Z -> Y and W -> Z <- X  and X - Y  =>  X -> Y
+        
+        Optimized: Uses numpy for graph operations since N is typically small
+        and avoids creating new JAX arrays in the inner loop.
         """
+        # Convert to numpy for faster in-place updates (small N)
+        graph_np = np.array(graph)
+        N = self.N
+        
         for iteration in range(max_iterations):
             changed = False
-            new_graph = graph.copy()
 
-            # R1: Chain rule
-            for x in range(self.N):
-                for y in range(self.N):
-                    if graph[x, y, 0] == 2:  # X -> Y
-                        for z in range(self.N):
-                            if graph[y, z, 0] == 3:  # Y - Z (undirected)
+            # R1: Chain rule - vectorized check
+            # Find all (x, y) where X -> Y (graph[x,y,0] == 2)
+            directed_xy = (graph_np[:, :, 0] == 2)
+            # Find all (y, z) where Y - Z (graph[y,z,0] == 3)
+            undirected_yz = (graph_np[:, :, 0] == 3)
+            
+            for x in range(N):
+                for y in range(N):
+                    if directed_xy[x, y]:
+                        for z in range(N):
+                            if undirected_yz[y, z]:
                                 # Check X not adjacent to Z
-                                x_adj_z = graph[x, z, 0] != 0 or graph[z, x, 0] != 0
+                                x_adj_z = graph_np[x, z, 0] != 0 or graph_np[z, x, 0] != 0
                                 if not x_adj_z:
-                                    new_graph = new_graph.at[y, z, 0].set(2)  # Y -> Z
-                                    new_graph = new_graph.at[z, y, 0].set(0)
+                                    graph_np[y, z, 0] = 2  # Y -> Z
+                                    graph_np[z, y, 0] = 0
                                     changed = True
 
             # R2: Acyclicity rule
-            for x in range(self.N):
-                for y in range(self.N):
-                    if graph[x, y, 0] == 3:  # X - Y
-                        for z in range(self.N):
-                            if graph[x, z, 0] == 2 and graph[z, y, 0] == 2:  # X -> Z -> Y
-                                new_graph = new_graph.at[x, y, 0].set(2)  # X -> Y
-                                new_graph = new_graph.at[y, x, 0].set(0)
+            undirected_xy = (graph_np[:, :, 0] == 3)
+            directed = (graph_np[:, :, 0] == 2)
+            
+            for x in range(N):
+                for y in range(N):
+                    if undirected_xy[x, y]:
+                        # Check if exists z such that X -> Z -> Y
+                        for z in range(N):
+                            if directed[x, z] and directed[z, y]:
+                                graph_np[x, y, 0] = 2  # X -> Y
+                                graph_np[y, x, 0] = 0
                                 changed = True
-
-            graph = new_graph
+                                break  # No need to check more z
 
             if not changed:
                 break
 
-        return graph
+        return jnp.array(graph_np)
 
     def _run_mci_plus(
         self,
@@ -756,7 +786,6 @@ class PCMCIPlus(PCMCI):
                     ]
 
                 for start, end in chunk_ranges:
-                    test_indices = []
                     i_list = []
                     j_list = []
                     tau_list = []
@@ -764,7 +793,6 @@ class PCMCIPlus(PCMCI):
                     cond_lags_list = [] if n_cond > 0 else None
 
                     for i, j, tau, cond_set in tests[start:end]:
-                        test_indices.append((i, j, tau))
                         i_list.append(i)
                         j_list.append(j)
                         tau_list.append(tau)
@@ -796,10 +824,6 @@ class PCMCIPlus(PCMCI):
                         )
 
                     stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr)
-
-                    i_arr = jnp.asarray([idx[0] for idx in test_indices], dtype=jnp.int32)
-                    j_arr = jnp.asarray([idx[1] for idx in test_indices], dtype=jnp.int32)
-                    tau_arr = jnp.asarray([idx[2] for idx in test_indices], dtype=jnp.int32)
                     val_matrix = val_matrix.at[i_arr, j_arr, tau_arr].set(stats)
                     pval_matrix = pval_matrix.at[i_arr, j_arr, tau_arr].set(pvals)
         else:

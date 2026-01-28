@@ -165,6 +165,7 @@ class PCMCI:
         self._parents: Dict[int, Set[Tuple[int, int]]] = {}
         self._pval_matrix: Optional[jax.Array] = None
         self._val_matrix: Optional[jax.Array] = None
+        self._batch_size_cache: Dict[Tuple[int, int], Optional[int]] = {}
 
     def _sample_condition_subsets(
         self,
@@ -237,6 +238,9 @@ class PCMCI:
             
         # Auto-compute batch size based on GPU memory
         if n_samples is not None:
+            cache_key = (n_samples, n_conditions)
+            if cache_key in self._batch_size_cache:
+                return self._batch_size_cache[cache_key]
             try:
                 device = jax.devices()[0]
                 if hasattr(device, 'memory_stats'):
@@ -252,9 +256,13 @@ class PCMCI:
                     
                     if bytes_per_test > 0:
                         computed_batch = max(64, int(available / bytes_per_test))
-                        return min(computed_batch, 4096)  # Cap at reasonable max
+                        batch = min(computed_batch, 4096)  # Cap at reasonable max
+                        self._batch_size_cache[cache_key] = batch
+                        return batch
             except Exception:
                 pass  # Fall through to None
+
+            self._batch_size_cache[cache_key] = None
         
         return None
 
@@ -526,9 +534,7 @@ class PCMCI:
                             ]
 
                         for start, end in chunk_ranges:
-                            parent_list = []
-                            for parent in parents_with_tau[start:end]:
-                                parent_list.append(parent)
+                            parent_list = parents_with_tau[start:end]
                             
                             i_arr = jnp.asarray([p[0] for p in parent_list], dtype=jnp.int32)
                             j_arr = jnp.full((len(parent_list),), j, dtype=jnp.int32)
@@ -544,10 +550,11 @@ class PCMCI:
                             stats, pvals = self.test.run_batch(X_batch, Y_batch, None, alpha=pc_alpha)
                             
                             # Mark non-significant (independent) parents for removal
-                            for idx, (val, pval) in enumerate(zip(stats, pvals)):
-                                if float(pval) > pc_alpha:  # Not significant = independent
-                                    parents_to_remove.append(parent_list[idx])
-                                    any_removed = True
+                            # Vectorized check: find indices where pvalue > pc_alpha
+                            independent_mask = np.asarray(pvals > pc_alpha)
+                            for idx in np.where(independent_mask)[0]:
+                                parents_to_remove.append(parent_list[idx])
+                                any_removed = True
                     
                     for parent in parents_to_remove:
                         parents[j].discard(parent)
@@ -623,13 +630,14 @@ class PCMCI:
 
                                 stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
 
-                                for idx, pval in enumerate(pvals):
-                                    if float(pval) > pc_alpha:
-                                        j_idx = batch_specs[idx][0]
-                                        p_idx = batch_specs[idx][1]
-                                        if p_idx in parents[j_idx]:
-                                            parents[j_idx].discard(p_idx)
-                                            any_removed = True
+                                # Vectorized: find independent pairs (pvalue > alpha)
+                                independent_mask = np.asarray(pvals > pc_alpha)
+                                for idx in np.where(independent_mask)[0]:
+                                    j_idx = batch_specs[idx][0]
+                                    p_idx = batch_specs[idx][1]
+                                    if p_idx in parents[j_idx]:
+                                        parents[j_idx].discard(p_idx)
+                                        any_removed = True
 
                     if self.verbosity >= 2 and any_removed:
                         print(f"  Batch removal completed for cond_dim {cond_dim}")
@@ -1042,7 +1050,6 @@ class PCMCI:
                 ]
 
             for start, end in chunk_ranges:
-                test_indices = []
                 i_list = []
                 j_list = []
                 tau_list = []
@@ -1050,7 +1057,6 @@ class PCMCI:
                 cond_lags_list = [] if n_cond > 0 else None
 
                 for i, j, tau, cond_set in tests[start:end]:
-                    test_indices.append((i, j, tau))
                     i_list.append(i)
                     j_list.append(j)
                     tau_list.append(tau)
@@ -1085,9 +1091,6 @@ class PCMCI:
                 stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr)
 
                 # Store results (vectorized scatter)
-                i_arr = jnp.asarray([idx[0] for idx in test_indices], dtype=jnp.int32)
-                j_arr = jnp.asarray([idx[1] for idx in test_indices], dtype=jnp.int32)
-                tau_arr = jnp.asarray([idx[2] for idx in test_indices], dtype=jnp.int32)
                 val_matrix = val_matrix.at[i_arr, j_arr, tau_arr].set(stats)
                 pval_matrix = pval_matrix.at[i_arr, j_arr, tau_arr].set(pvals)
 

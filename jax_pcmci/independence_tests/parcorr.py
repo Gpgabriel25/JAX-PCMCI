@@ -172,10 +172,18 @@ def _batch_partial_correlation_jit(
 
 @jax.jit
 def _batch_pvalue_jit(
-    statistics: jax.Array, n_samples: int, n_conditions: int
+    statistics: jax.Array, n_samples: jax.Array, n_conditions: jax.Array
 ) -> jax.Array:
-    """Compute p-values for batched statistics."""
-    return jax.vmap(lambda s: _parcorr_pvalue(s, n_samples, n_conditions))(statistics)
+    """Compute p-values for batched statistics (vectorized)."""
+    df = n_samples - n_conditions - 3
+    df = jnp.maximum(df, 1)
+
+    r_clipped = jnp.clip(statistics, -0.9999, 0.9999)
+    z = 0.5 * jnp.log((1 + r_clipped) / (1 - r_clipped))
+    se = 1.0 / jnp.sqrt(df)
+    z_stat = z / se
+
+    return 2 * (1 - jax_stats.norm.cdf(jnp.abs(z_stat)))
 
 
 class ParCorr(CondIndTest):
@@ -301,88 +309,6 @@ class ParCorr(CondIndTest):
             # Partial correlation via residuals
             return _compute_partial_correlation_jit(X, Y, Z)
 
-    @staticmethod
-    @jax.jit
-    def _compute_correlation(X: jax.Array, Y: jax.Array) -> jax.Array:
-        """
-        Compute Pearson correlation between X and Y.
-
-        Uses a numerically stable computation via centered and normalized
-        vectors.
-        """
-        # Center the variables
-        X_centered = X - jnp.mean(X)
-        Y_centered = Y - jnp.mean(Y)
-
-        # Compute correlation
-        numerator = jnp.sum(X_centered * Y_centered)
-        denominator = jnp.sqrt(jnp.sum(X_centered**2) * jnp.sum(Y_centered**2))
-
-        # Handle zero denominator
-        correlation = jnp.where(
-            denominator > 1e-10,
-            numerator / denominator,
-            0.0
-        )
-
-        # Clip to [-1, 1] for numerical stability
-        return jnp.clip(correlation, -1.0, 1.0)
-
-    @staticmethod
-    @jax.jit
-    def _compute_partial_correlation(
-        X: jax.Array, Y: jax.Array, Z: jax.Array
-    ) -> jax.Array:
-        """
-        Compute partial correlation via OLS residuals.
-
-        This computes the correlation between the residuals of X and Y
-        after regressing each on Z.
-        """
-        # Get residuals from regressing X on Z
-        X_residual = ParCorr._compute_residual(X, Z)
-
-        # Get residuals from regressing Y on Z
-        Y_residual = ParCorr._compute_residual(Y, Z)
-
-        # Correlation of residuals
-        return ParCorr._compute_correlation(X_residual, Y_residual)
-
-    @staticmethod
-    @jax.jit
-    def _compute_residual(target: jax.Array, predictors: jax.Array) -> jax.Array:
-        """
-        Compute OLS residuals: target - Z @ (Z^T Z)^{-1} Z^T target
-
-        Optimized using Cholesky solve on centered data for speed and memory efficiency.
-        """
-        # Ensure 2D
-        if predictors.ndim == 1:
-            predictors = predictors.reshape(-1, 1)
-
-        # Center data to avoid adding intercept column (saves memory/compute)
-        target_c = target - jnp.mean(target)
-        predictors_c = predictors - jnp.mean(predictors, axis=0)
-
-        # Solve normal equations: (Z^T Z) beta = Z^T y
-        # Using regularization for numerical stability (similar to rcond in lstsq)
-        gram = predictors_c.T @ predictors_c
-        
-        # Regularization proportional to trace or fixed small value
-        # 1e-6 is usually sufficient for stability
-        ridge = 1e-6 * jnp.eye(gram.shape[0], dtype=gram.dtype)
-        
-        # Compute coefficients: beta = (Z'Z + lambda*I)^-1 Z'y
-        # sym_pos=True uses Cholesky which is faster than general solve or lstsq
-        rhs = predictors_c.T @ target_c
-        coeffs = linalg.solve(gram + ridge, rhs, assume_a='pos')
-
-        # Compute residuals
-        predicted = predictors_c @ coeffs
-        residual = target_c - predicted
-
-        return residual
-
     def compute_pvalue(
         self, statistic: jax.Array, n_samples: int, n_conditions: int
     ) -> jax.Array:
@@ -445,22 +371,43 @@ class ParCorr(CondIndTest):
         >>> print(f"Corr(X0(t-2), X1(t)): {corr_matrix[0, 1, 2]:.3f}")
         """
         T, N = data.shape
-        corr_matrix = jnp.zeros((N, N, tau_max + 1))
-
-        for tau in range(tau_max + 1):
+        
+        # Vectorized implementation: for each tau, compute all N*N correlations at once
+        def compute_corrs_for_tau(tau):
             effective_T = T - tau
-            for i in range(N):
-                for j in range(N):
-                    if tau == 0:
-                        X = data[:, i]
-                        Y = data[:, j]
-                    else:
-                        X = data[: T - tau, i]  # X at t - tau
-                        Y = data[tau:, j]  # Y at t
-
-                    corr_matrix = corr_matrix.at[i, j, tau].set(
-                        _compute_correlation_jit(X, Y)
-                    )
+            # For tau=0, use full data; for tau>0, use lagged data
+            X_data = jax.lax.cond(
+                tau == 0,
+                lambda: data,
+                lambda: data[: T - tau, :]  # X at t - tau
+            )[:effective_T, :]
+            Y_data = jax.lax.cond(
+                tau == 0,
+                lambda: data,
+                lambda: data[tau:, :]  # Y at t
+            )[:effective_T, :]
+            
+            # Center data for all variables at once
+            X_centered = X_data - jnp.mean(X_data, axis=0, keepdims=True)
+            Y_centered = Y_data - jnp.mean(Y_data, axis=0, keepdims=True)
+            
+            # Compute all pairwise correlations: corr[i,j] = sum(X_i * Y_j) / sqrt(sum(X_i^2) * sum(Y_j^2))
+            # Using matrix operations: (X^T @ Y) / outer(norm_X, norm_Y)
+            norms_X = jnp.sqrt(jnp.sum(X_centered**2, axis=0))
+            norms_Y = jnp.sqrt(jnp.sum(Y_centered**2, axis=0))
+            
+            # Handle zero norms
+            norms_X = jnp.where(norms_X > 1e-10, norms_X, 1.0)
+            norms_Y = jnp.where(norms_Y > 1e-10, norms_Y, 1.0)
+            
+            # Correlation matrix for this tau
+            cov_matrix = X_centered.T @ Y_centered / effective_T
+            corr_tau = cov_matrix / jnp.outer(norms_X, norms_Y) * effective_T
+            
+            return jnp.clip(corr_tau, -1.0, 1.0)
+        
+        # Stack results for all taus
+        corr_matrix = jnp.stack([compute_corrs_for_tau(tau) for tau in range(tau_max + 1)], axis=2)
 
         return corr_matrix
 
@@ -509,8 +456,11 @@ class ParCorr(CondIndTest):
         This overrides the base class implementation for maximum performance
         by using module-level JIT'd functions instead of method-based JIT.
         """
-        n_samples = X_batch.shape[1]
-        n_conditions = 0 if Z_batch is None else (Z_batch.shape[2] if Z_batch.ndim == 3 else 1)
+        n_samples = jnp.asarray(X_batch.shape[1], dtype=jnp.int32)
+        n_conditions = jnp.asarray(
+            0 if Z_batch is None else (Z_batch.shape[2] if Z_batch.ndim == 3 else 1),
+            dtype=jnp.int32,
+        )
         
         # Compute statistics in a single vectorized call
         if Z_batch is None:

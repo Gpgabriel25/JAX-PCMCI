@@ -179,11 +179,9 @@ class CondIndTest(ABC):
         self._base_key = jax.random.PRNGKey(seed)
         self._rng_counter = 0
 
-        # Cached JITed batch runners to avoid Python overhead on repeated calls
-        self._run_batch_no_z = jax.jit(lambda X, Y: self._run_batch_no_z_impl(X, Y))
-        self._run_batch_with_z = jax.jit(
-            lambda X, Y, Z: self._run_batch_with_z_impl(X, Y, Z)
-        )
+        # Note: We don't cache JIT'd batch runners at instance level because
+        # capturing `self` in a JIT'd lambda causes recompilation per instance.
+        # Instead, subclasses should override run_batch with proper JIT strategy.
 
     @abstractmethod
     def compute_statistic(
@@ -362,9 +360,11 @@ class CondIndTest(ABC):
             Batch of conditioning variables, shape (n_tests, n_samples, n_cond).
         alpha : float or None
         """
+        # Call implementations directly - subclasses like ParCorr override
+        # run_batch for better JIT strategy
         if Z_batch is None:
-            return self._run_batch_no_z(X_batch, Y_batch)
-        return self._run_batch_with_z(X_batch, Y_batch, Z_batch)
+            return self._run_batch_no_z_impl(X_batch, Y_batch)
+        return self._run_batch_with_z_impl(X_batch, Y_batch, Z_batch)
 
     # ----- JITed batch helpers -------------------------------------------------
 
