@@ -290,13 +290,15 @@ PCMCI+ extends PCMCI to handle contemporaneous (τ=0) causal links:
 2. **Orientation**: Uses time order and v-structure rules to orient edges
 3. **MCI Testing**: Final tests with full conditioning sets
 
-## 🧪 Comparison with Tigramite
+##  Comparison with Tigramite
+
+
 
 | Feature | JAX-PCMCI | Tigramite |
 |---------|-----------|-----------|
-| GPU/TPU Support | ✅ Native | ❌ CPU only |
-| Parallelization | ✅ vmap/pmap | ⚠️ Limited |
-| JIT Compilation | ✅ Full | ❌ No |
+| GPU/TPU Support |  Native |  CPU only |
+| Parallelization |  vmap/pmap |  Limited |
+| JIT Compilation |  Full |  No |
 | Independence Tests | ParCorr, CMI, GPDC | Many |
 | Speed (GPU) | 10-100x faster | Baseline |
 
@@ -313,6 +315,6 @@ PCMCI+ extends PCMCI to handle contemporaneous (τ=0) causal links:
 MIT License - see [LICENSE](LICENSE) for details.
 
 
-## 📧 Contact
+## Contact
 
 For questions or issues, please open a GitHub issue or contact me at gpgabriel25@gmail.com
