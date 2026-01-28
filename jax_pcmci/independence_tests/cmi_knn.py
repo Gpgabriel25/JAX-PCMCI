@@ -257,14 +257,12 @@ class CMIKnn(CondIndTest):
             # Euclidean norm
             distances = self._euclidean_distances(data, data)
 
-        # Set self-distance to infinity to exclude it from k-NN search
-        distances = jnp.where(jnp.eye(n, dtype=bool), jnp.inf, distances)
+        # Set self-distance to infinity
+        distances = distances + jnp.eye(n) * jnp.inf
 
-        # Use top_k which is optimized on GPU - returns k smallest values
-        # We need (k+1) to account for the point itself, then take the k-th
-        # top_k returns smallest k elements, so we partition at k
-        kth_distances = jax.lax.top_k(-distances, k)[0][:, -1]
-        kth_distances = -kth_distances  # Negate back
+        # Get k-th neighbor without a full sort (much faster than sort)
+        # (0-indexed, so k-1)
+        kth_distances = jnp.partition(distances, k - 1, axis=1)[:, k - 1]
 
         return kth_distances
 
@@ -294,9 +292,7 @@ class CMIKnn(CondIndTest):
         Compute Chebyshev (max-norm) distances between all pairs.
         """
         # X: (n, d), Y: (m, d) -> output: (n, m)
-        # More memory efficient: compute differences first, then max
-        diff = X[:, None, :] - Y[None, :, :]
-        return jnp.max(jnp.abs(diff), axis=2)
+        return jnp.max(jnp.abs(X[:, None, :] - Y[None, :, :]), axis=2)
 
     @staticmethod
     @jax.jit

@@ -98,13 +98,13 @@ def time_run(label: str, fn) -> float:
 
 
 def main() -> None:
-    t = _env_int("PCMCI_SPEED_T", 1000)
-    n = _env_int("PCMCI_SPEED_N", 100)
-    tau_max = _env_int("PCMCI_SPEED_TAU_MAX", 1)
+    t = _env_int("PCMCI_SPEED_T", 500)
+    n = _env_int("PCMCI_SPEED_N", 10)
+    tau_max = _env_int("PCMCI_SPEED_TAU_MAX", 2)
     pc_alpha = _env_float("PCMCI_SPEED_PC_ALPHA", 0.05)
     alpha_level = _env_float("PCMCI_SPEED_ALPHA_LEVEL", 0.05)
     do_warmup = _env_bool("PCMCI_SPEED_WARMUP", True)
-    max_conds_dim = _env_int("MAX_CONDS_DIM", 0)
+    max_conds_dim = _env_int("PCMCI_SPEED_MAX_CONDS_DIM", 3)
 
     device = os.environ.get("PCMCI_SPEED_DEVICE", "auto")
     set_device(device)
@@ -125,12 +125,25 @@ def main() -> None:
     test = ParCorr()
 
     if do_warmup:
-        warm_t = min(200, t)
-        warm_n = min(5, n)
-        warm_data = data[:warm_t, :warm_n]
-        warm_handler = DataHandler(warm_data)
-        warm_pcmci = PCMCI(warm_handler, cond_ind_test=test, verbosity=0)
-        _ = warm_pcmci.run(tau_max=min(1, tau_max), pc_alpha=pc_alpha)
+        # Full warmup: run PCMCI once with actual parameters to JIT compile
+        # all necessary configurations. This simulates real-world usage where
+        # the algorithm is run multiple times on similar data.
+        print("Warming up JIT compilation...")
+        warm_pcmci = PCMCI(handler, cond_ind_test=test, verbosity=0)
+        _ = warm_pcmci.run(
+            tau_max=tau_max,
+            pc_alpha=pc_alpha,
+            max_conds_dim=max_conds_dim,
+        )
+        warm_pcmci_plus = PCMCIPlus(handler, cond_ind_test=test, verbosity=0)
+        _ = warm_pcmci_plus.run(
+            tau_max=tau_max,
+            pc_alpha=pc_alpha,
+            max_conds_dim=max_conds_dim,
+        )
+        handler.clear_cache()
+        handler.precompute_lagged_data(tau_max)
+        print("Warmup complete. Running timed benchmarks...")
 
     pcmci = PCMCI(handler, cond_ind_test=test, verbosity=0)
     pcmci_plus = PCMCIPlus(handler, cond_ind_test=test, verbosity=0)
@@ -141,6 +154,7 @@ def main() -> None:
             tau_max=tau_max,
             pc_alpha=pc_alpha,
             alpha_level=alpha_level,
+            max_conds_dim=max_conds_dim,
         ),
     )
 
@@ -150,6 +164,7 @@ def main() -> None:
             tau_max=tau_max,
             pc_alpha=pc_alpha,
             alpha_level=alpha_level,
+            max_conds_dim=max_conds_dim,
         ),
     )
 

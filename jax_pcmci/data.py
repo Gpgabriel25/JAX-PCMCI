@@ -283,11 +283,15 @@ class DataHandler:
             data_array = jnp.asarray(data, dtype=self._dtype)
             self._data = TimeSeriesData(values=data_array, var_names=var_names)
 
+        # Get config once
+        config = get_config()
+        
         # Cache for lagged data cubes - keyed by (tau_max, include_contemporaneous)
-        self._lagged_cache: Dict[Tuple[int, bool], Tuple[jax.Array, jax.Array]] = {}
+        # Use OrderedDict for LRU cache behavior
+        self._lagged_cache: "OrderedDict[Tuple[int, bool], Tuple[jax.Array, jax.Array]]" = OrderedDict()
+        self._cache_max_entries = config.cache_max_entries
 
         # Cache for variable pair slices
-        config = get_config()
         self._pair_cache: Optional[
             "OrderedDict[Tuple, Tuple[jax.Array, jax.Array, Optional[jax.Array]]]"
         ] = (
@@ -449,6 +453,8 @@ class DataHandler:
         # Check cache
         cache_key = (tau_max, include_contemporaneous)
         if cache_key in self._lagged_cache:
+            # Move to end (most recently used)
+            self._lagged_cache.move_to_end(cache_key)
             return self._lagged_cache[cache_key]
 
         T, N = self.T, self.N
@@ -457,21 +463,25 @@ class DataHandler:
         # Current values (t = tau_max, tau_max+1, ..., T-1)
         X_current = self.values[tau_max:]
 
-        # Build lagged array efficiently using slicing
+        # Build lagged array using simple slicing (faster than lax.scan for this pattern)
         if include_contemporaneous:
-            n_lags = tau_max + 1
-            start_lag = 0
+            lags = list(range(0, tau_max + 1))
         else:
-            n_lags = tau_max
-            start_lag = 1
+            lags = list(range(1, tau_max + 1))
 
-        # Use list comprehension then stack (faster than loop with .at[].set())
-        X_lagged = jnp.stack([
-            self.values[tau_max - lag : T - lag, :]
-            for lag in range(start_lag, start_lag + n_lags)
-        ], axis=2)
+        n_lags = len(lags)
+        lagged_slices = []
+        for lag in lags:
+            start_t = tau_max - lag
+            end_t = start_t + effective_T
+            lagged_slices.append(self.values[start_t:end_t, :])
+        
+        X_lagged = jnp.stack(lagged_slices, axis=2)
 
-        # Store in cache
+        # Store in cache with LRU eviction
+        if len(self._lagged_cache) >= self._cache_max_entries:
+            # Remove oldest entry
+            self._lagged_cache.popitem(last=False)
         self._lagged_cache[cache_key] = (X_current, X_lagged)
 
         return X_current, X_lagged
@@ -562,10 +572,12 @@ class DataHandler:
             )
 
         # Source variable at t - tau
-        # Both X and Y need to be aligned to the same time window
-        # X at time (t-tau) where t ranges from max_lag to T-1
-        # Y at time t where t ranges from max_lag to T-1
-        X = self.values[max_lag - tau : self.T - tau, i]
+        if tau == 0:
+            X = self.values[max_lag:, i]
+        else:
+            X = self.values[max_lag - tau : self.T - tau, i]
+
+        # Target variable at t
         Y = self.values[max_lag:, j]
 
         # Conditioning set
@@ -597,14 +609,12 @@ class DataHandler:
         var_idxs: jax.Array,
         length: int,
     ) -> jax.Array:
-        """Vectorized 1D slice extraction using advanced indexing."""
-        # Use advanced indexing which is more efficient than vmap of dynamic_slice
-        # Create index arrays for all positions
-        time_offsets = jnp.arange(length)  # [0, 1, 2, ..., length-1]
-        time_indices = start_idxs[:, None] + time_offsets[None, :]  # (batch, length)
-        
-        # Gather values using advanced indexing
-        return values[time_indices, var_idxs[:, None]]
+        """Vectorized 1D slice extraction using dynamic slicing."""
+
+        def slice_one(start_idx, var_idx):
+            return lax.dynamic_slice(values, (start_idx, var_idx), (length, 1)).squeeze(1)
+
+        return jax.vmap(slice_one)(start_idxs, var_idxs)
 
     def get_variable_pair_batch(
         self,
@@ -654,16 +664,19 @@ class DataHandler:
             return X, Y, None
 
         n_cond = cond_vars.shape[1]
-        Z = jnp.zeros((cond_vars.shape[0], effective_T, n_cond), dtype=self.values.dtype)
-
-        def body(k, z):
-            vars_col = cond_vars[:, k]
-            lags_col = cond_lags[:, k]
-            starts = max_lag - lags_col
-            z_k = self._batch_slice_1d(self.values, starts, vars_col, effective_T)
-            return z.at[:, :, k].set(z_k)
-
-        Z = lax.fori_loop(0, n_cond, body, Z)
+        batch_size = cond_vars.shape[0]
+        
+        # Vectorize over conditioning variables: process all at once
+        # Reshape to (batch * n_cond,) for vectorized slicing
+        vars_flat = cond_vars.reshape(-1)
+        lags_flat = cond_lags.reshape(-1)
+        starts_flat = max_lag - lags_flat
+        
+        # Get all conditioning slices in one vectorized call
+        Z_flat = self._batch_slice_1d(self.values, starts_flat, vars_flat, effective_T)
+        
+        # Reshape back to (batch, effective_T, n_cond)
+        Z = Z_flat.reshape(batch_size, n_cond, effective_T).transpose(0, 2, 1)
         return X, Y, Z
 
     @staticmethod

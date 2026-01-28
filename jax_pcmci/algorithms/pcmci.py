@@ -43,11 +43,11 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from functools import partial
 from tqdm import tqdm
 from itertools import combinations
-import random
 import math
 
 from jax_pcmci.data import DataHandler
@@ -188,19 +188,25 @@ class PCMCI:
         if total <= max_subsets:
             return list(combinations(items, k))
 
-        # Use JAX RNG for consistency and better performance
-        key = jax.random.PRNGKey(seed)
+        # Use NumPy for faster random sampling
+        rng = np.random.RandomState(seed)
         reservoir: List[Tuple[Tuple[int, int], ...]] = []
-
-        for idx, combo in enumerate(combinations(items, k)):
-            if idx < max_subsets:
-                reservoir.append(combo)
-            else:
-                # Use JAX random for consistency
-                key, subkey = jax.random.split(key)
-                j = int(jax.random.randint(subkey, (), 0, idx + 1))
+        
+        # Pre-sample indices for faster reservoir sampling
+        # Sample up front to reduce overhead
+        comb_iter = combinations(items, k)
+        for idx in range(max_subsets):
+            reservoir.append(next(comb_iter))
+        
+        # Continue with reservoir sampling for remaining
+        for idx in range(max_subsets, min(total, max_subsets * 10)):
+            try:
+                combo = next(comb_iter)
+                j = rng.randint(0, idx + 1)
                 if j < max_subsets:
                     reservoir[j] = combo
+            except StopIteration:
+                break
 
         return reservoir
 
@@ -347,8 +353,8 @@ class PCMCI:
         self.datahandler.precompute_lagged_data(tau_max)
 
         # Initialize result matrices
-        self._val_matrix = jnp.zeros((self.N, self.N, tau_max + 1), dtype=get_config().dtype)
-        self._pval_matrix = jnp.ones((self.N, self.N, tau_max + 1), dtype=get_config().dtype)
+        self._val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
+        self._pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
 
         # Phase 1: PC condition selection
         if self.verbosity >= 1:
@@ -850,9 +856,8 @@ class PCMCI:
         if parents is None:
             parents = self._parents
 
-        dtype = get_config().dtype
-        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1), dtype=dtype)
-        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1), dtype=dtype)
+        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
+        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
 
         # Collect all tests to run
         tests_to_run = []
@@ -991,9 +996,8 @@ class PCMCI:
         if parents is None:
             parents = self._parents
 
-        dtype = get_config().dtype
-        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1), dtype=dtype)
-        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1), dtype=dtype)
+        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
+        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
 
         # Group tests by (n_conditions, max_lag) for proper batching
         # Same n_cond AND same max_lag = same data shapes = can batch

@@ -34,7 +34,7 @@ Example
 from __future__ import annotations
 
 from functools import partial
-from typing import Optional
+from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +44,130 @@ from jax.scipy import linalg
 
 from jax_pcmci.independence_tests.base import CondIndTest
 from jax_pcmci.config import get_config
+
+
+# ============================================================================
+# Standalone JIT-compiled functions for maximum performance
+# These avoid the overhead of `self` in static_argnums
+# ============================================================================
+
+
+@jax.jit
+def _parcorr_pvalue(statistic: jax.Array, n_samples: int, n_conditions: int) -> jax.Array:
+    """
+    Compute p-value using Fisher's z-transformation (standalone JITted version).
+    
+    This is a module-level function to avoid JIT recompilation when `self` changes.
+    """
+    # Degrees of freedom
+    df = n_samples - n_conditions - 3
+
+    # Handle edge cases
+    df = jnp.maximum(df, 1)
+
+    # Fisher's z-transformation
+    # Clip to avoid log(0) for |r| = 1
+    r_clipped = jnp.clip(statistic, -0.9999, 0.9999)
+    z = 0.5 * jnp.log((1 + r_clipped) / (1 - r_clipped))
+
+    # Standard error under H0
+    se = 1.0 / jnp.sqrt(df)
+
+    # Test statistic
+    z_stat = z / se
+
+    # Two-sided p-value from standard normal
+    pvalue = 2 * (1 - jax_stats.norm.cdf(jnp.abs(z_stat)))
+
+    return pvalue
+
+
+@jax.jit
+def _compute_correlation_jit(X: jax.Array, Y: jax.Array) -> jax.Array:
+    """
+    Compute Pearson correlation between X and Y (standalone JITted version).
+    """
+    # Center the variables
+    X_centered = X - jnp.mean(X)
+    Y_centered = Y - jnp.mean(Y)
+
+    # Compute correlation
+    numerator = jnp.sum(X_centered * Y_centered)
+    denominator = jnp.sqrt(jnp.sum(X_centered**2) * jnp.sum(Y_centered**2))
+
+    # Handle zero denominator
+    correlation = jnp.where(
+        denominator > 1e-10,
+        numerator / denominator,
+        0.0
+    )
+
+    # Clip to [-1, 1] for numerical stability
+    return jnp.clip(correlation, -1.0, 1.0)
+
+
+@jax.jit
+def _compute_residual_jit(target: jax.Array, predictors: jax.Array) -> jax.Array:
+    """
+    Compute OLS residuals (standalone JITted version).
+    """
+    # Ensure 2D
+    predictors = jnp.atleast_2d(predictors)
+    if predictors.shape[0] == 1 and predictors.shape[1] != target.shape[0]:
+        predictors = predictors.T
+
+    # Center data to avoid adding intercept column (saves memory/compute)
+    target_c = target - jnp.mean(target)
+    predictors_c = predictors - jnp.mean(predictors, axis=0)
+
+    # Solve normal equations: (Z^T Z) beta = Z^T y
+    gram = predictors_c.T @ predictors_c
+    
+    # Regularization for numerical stability
+    ridge = 1e-6 * jnp.eye(gram.shape[0], dtype=gram.dtype)
+    
+    # Compute coefficients
+    rhs = predictors_c.T @ target_c
+    coeffs = linalg.solve(gram + ridge, rhs, assume_a='pos')
+
+    # Compute residuals
+    predicted = predictors_c @ coeffs
+    residual = target_c - predicted
+
+    return residual
+
+
+@jax.jit
+def _compute_partial_correlation_jit(X: jax.Array, Y: jax.Array, Z: jax.Array) -> jax.Array:
+    """
+    Compute partial correlation via OLS residuals (standalone JITted version).
+    """
+    X_residual = _compute_residual_jit(X, Z)
+    Y_residual = _compute_residual_jit(Y, Z)
+    return _compute_correlation_jit(X_residual, Y_residual)
+
+
+# Vectorized batch versions for maximum GPU throughput
+@jax.jit
+def _batch_correlation_jit(X_batch: jax.Array, Y_batch: jax.Array) -> jax.Array:
+    """Compute correlations for batched inputs."""
+    return jax.vmap(_compute_correlation_jit)(X_batch, Y_batch)
+
+
+@jax.jit
+def _batch_partial_correlation_jit(
+    X_batch: jax.Array, Y_batch: jax.Array, Z_batch: jax.Array
+) -> jax.Array:
+    """Compute partial correlations for batched inputs."""
+    return jax.vmap(_compute_partial_correlation_jit)(X_batch, Y_batch, Z_batch)
+
+
+@jax.jit
+def _batch_pvalue_jit(
+    statistics: jax.Array, n_samples: int, n_conditions: int
+) -> jax.Array:
+    """Compute p-values for batched statistics."""
+    return jax.vmap(lambda s: _parcorr_pvalue(s, n_samples, n_conditions))(statistics)
 
 
 class ParCorr(CondIndTest):
@@ -133,7 +257,6 @@ class ParCorr(CondIndTest):
         )
         self.robust = robust
 
-    @partial(jax.jit, static_argnums=(0,))
     def compute_statistic(
         self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array] = None
     ) -> jax.Array:
@@ -154,18 +277,21 @@ class ParCorr(CondIndTest):
         jax.Array
             Partial correlation coefficient in [-1, 1].
         """
-        # Ensure proper dtype
+        # Ensure proper dtype - only convert if needed
         dtype = get_config().dtype
-        X = jnp.asarray(X, dtype=dtype)
-        Y = jnp.asarray(Y, dtype=dtype)
+        if not isinstance(X, jax.Array) or X.dtype != dtype:
+            X = jnp.asarray(X, dtype=dtype)
+        if not isinstance(Y, jax.Array) or Y.dtype != dtype:
+            Y = jnp.asarray(Y, dtype=dtype)
 
         if Z is None or (hasattr(Z, 'shape') and Z.shape[-1] == 0):
             # Simple correlation (no conditioning)
-            return self._compute_correlation(X, Y)
+            return _compute_correlation_jit(X, Y)
         else:
-            Z = jnp.asarray(Z, dtype=dtype)
+            if not isinstance(Z, jax.Array) or Z.dtype != dtype:
+                Z = jnp.asarray(Z, dtype=dtype)
             # Partial correlation via residuals
-            return self._compute_partial_correlation(X, Y, Z)
+            return _compute_partial_correlation_jit(X, Y, Z)
 
     @staticmethod
     @jax.jit
@@ -220,7 +346,7 @@ class ParCorr(CondIndTest):
         """
         Compute OLS residuals: target - Z @ (Z^T Z)^{-1} Z^T target
 
-        Uses QR decomposition for better numerical stability and performance.
+        Optimized using Cholesky solve on centered data for speed and memory efficiency.
         """
         # Ensure 2D
         if predictors.ndim == 1:
@@ -230,21 +356,25 @@ class ParCorr(CondIndTest):
         target_c = target - jnp.mean(target)
         predictors_c = predictors - jnp.mean(predictors, axis=0)
 
-        # Use QR decomposition: much more stable and faster than solving normal equations
-        # Q @ R = predictors_c
-        # beta = R^-1 @ Q^T @ target_c
-        Q, R = jnp.linalg.qr(predictors_c)
+        # Solve normal equations: (Z^T Z) beta = Z^T y
+        # Using regularization for numerical stability (similar to rcond in lstsq)
+        gram = predictors_c.T @ predictors_c
         
-        # Compute coefficients: beta = R^-1 @ (Q^T @ target_c)
-        Qty = Q.T @ target_c
-        coeffs = linalg.solve_triangular(R, Qty, lower=False)
+        # Regularization proportional to trace or fixed small value
+        # 1e-6 is usually sufficient for stability
+        ridge = 1e-6 * jnp.eye(gram.shape[0], dtype=gram.dtype)
+        
+        # Compute coefficients: beta = (Z'Z + lambda*I)^-1 Z'y
+        # sym_pos=True uses Cholesky which is faster than general solve or lstsq
+        rhs = predictors_c.T @ target_c
+        coeffs = linalg.solve(gram + ridge, rhs, assume_a='pos')
 
-        # Compute residuals more efficiently: residual = target_c - Q @ Q^T @ target_c
-        residual = target_c - Q @ Qty
+        # Compute residuals
+        predicted = predictors_c @ coeffs
+        residual = target_c - predicted
 
         return residual
 
-    @partial(jax.jit, static_argnums=(0,))
     def compute_pvalue(
         self, statistic: jax.Array, n_samples: int, n_conditions: int
     ) -> jax.Array:
@@ -274,27 +404,7 @@ class ParCorr(CondIndTest):
         jax.Array
             Two-sided p-value.
         """
-        # Degrees of freedom
-        df = n_samples - n_conditions - 3
-
-        # Handle edge cases
-        df = jnp.maximum(df, 1)
-
-        # Fisher's z-transformation
-        # Clip to avoid log(0) for |r| = 1
-        r_clipped = jnp.clip(statistic, -0.9999, 0.9999)
-        z = 0.5 * jnp.log((1 + r_clipped) / (1 - r_clipped))
-
-        # Standard error under H0
-        se = 1.0 / jnp.sqrt(df)
-
-        # Test statistic
-        z_stat = z / se
-
-        # Two-sided p-value from standard normal
-        pvalue = 2 * (1 - jax_stats.norm.cdf(jnp.abs(z_stat)))
-
-        return pvalue
+        return _parcorr_pvalue(statistic, n_samples, n_conditions)
 
     def get_correlation_matrix(
         self, data: jax.Array, tau_max: int = 0
@@ -329,36 +439,23 @@ class ParCorr(CondIndTest):
         T, N = data.shape
         corr_matrix = jnp.zeros((N, N, tau_max + 1))
 
-        # Vectorize over lags for better performance
         for tau in range(tau_max + 1):
             effective_T = T - tau
-            if tau == 0:
-                # Contemporaneous correlations - can vectorize fully
-                data_centered = data[:effective_T] - jnp.mean(data[:effective_T], axis=0)
-                cov = data_centered.T @ data_centered / effective_T
-                std = jnp.std(data[:effective_T], axis=0)
-                std_prod = std[:, None] * std[None, :]
-                corr = jnp.where(std_prod > 1e-10, cov / std_prod, 0.0)
-                corr_matrix = corr_matrix.at[:, :, tau].set(corr)
-            else:
-                # Lagged correlations - vectorize over variable pairs
-                X_lagged = data[: T - tau, :]  # X at t - tau
-                Y_current = data[tau:, :]  # Y at t
-                
-                # Vectorized correlation computation
-                X_centered = X_lagged - jnp.mean(X_lagged, axis=0)
-                Y_centered = Y_current - jnp.mean(Y_current, axis=0)
-                
-                cov = X_centered.T @ Y_centered / effective_T
-                std_x = jnp.std(X_lagged, axis=0)
-                std_y = jnp.std(Y_current, axis=0)
-                std_prod = std_x[:, None] * std_y[None, :]
-                corr = jnp.where(std_prod > 1e-10, cov / std_prod, 0.0)
-                corr_matrix = corr_matrix.at[:, :, tau].set(corr)
+            for i in range(N):
+                for j in range(N):
+                    if tau == 0:
+                        X = data[:, i]
+                        Y = data[:, j]
+                    else:
+                        X = data[: T - tau, i]  # X at t - tau
+                        Y = data[tau:, j]  # Y at t
+
+                    corr_matrix = corr_matrix.at[i, j, tau].set(
+                        _compute_correlation_jit(X, Y)
+                    )
 
         return corr_matrix
 
-    @partial(jax.jit, static_argnums=(0,))
     def compute_statistic_batch(
         self,
         X_batch: jax.Array,
@@ -385,13 +482,42 @@ class ParCorr(CondIndTest):
             Partial correlations, shape (n_tests,).
         """
         if Z_batch is None:
-            # Vectorized simple correlation
-            return jax.vmap(self._compute_correlation)(X_batch, Y_batch)
+            # Vectorized simple correlation using standalone function
+            return _batch_correlation_jit(X_batch, Y_batch)
         else:
-            # Vectorized partial correlation
-            return jax.vmap(self._compute_partial_correlation)(
-                X_batch, Y_batch, Z_batch
-            )
+            # Vectorized partial correlation using standalone function
+            return _batch_partial_correlation_jit(X_batch, Y_batch, Z_batch)
+
+    def run_batch(
+        self,
+        X_batch: jax.Array,
+        Y_batch: jax.Array,
+        Z_batch: Optional[jax.Array] = None,
+        alpha: Optional[float] = None,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """
+        Optimized batch implementation for ParCorr.
+        
+        This overrides the base class implementation for maximum performance
+        by using module-level JIT'd functions instead of method-based JIT.
+        """
+        n_samples = X_batch.shape[1]
+        n_conditions = 0 if Z_batch is None else (Z_batch.shape[2] if Z_batch.ndim == 3 else 1)
+        
+        # Compute statistics in a single vectorized call
+        if Z_batch is None:
+            statistics = _batch_correlation_jit(X_batch, Y_batch)
+        else:
+            statistics = _batch_partial_correlation_jit(X_batch, Y_batch, Z_batch)
+        
+        # Compute p-values
+        if self.significance == "analytic":
+            pvalues = _batch_pvalue_jit(statistics, n_samples, n_conditions)
+        else:
+            # Fall back to base class permutation method
+            pvalues = self._batch_permutation_pvalues(X_batch, Y_batch, Z_batch, statistics)
+        
+        return statistics, pvalues
 
     def __repr__(self) -> str:
         return (

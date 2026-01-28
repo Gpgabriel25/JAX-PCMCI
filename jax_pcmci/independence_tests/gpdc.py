@@ -257,17 +257,11 @@ class GPDCond(CondIndTest):
         # Compute kernel matrix
         K = self.kernel(X, X)
 
-        # Add noise variance to diagonal for numerical stability
-        K_noisy = K + (self.noise_var + 1e-6) * jnp.eye(n)
+        # Add noise variance to diagonal
+        K_noisy = K + self.noise_var * jnp.eye(n)
 
-        # Solve K⁻¹ y using Cholesky (more efficient than direct solve)
-        try:
-            L = jnp.linalg.cholesky(K_noisy)
-        except:
-            # Fallback: add more regularization if Cholesky fails
-            K_noisy = K + (self.noise_var + 1e-4) * jnp.eye(n)
-            L = jnp.linalg.cholesky(K_noisy)
-            
+        # Solve K⁻¹ y using Cholesky
+        L = jnp.linalg.cholesky(K_noisy + 1e-6 * jnp.eye(n))
         alpha = jax.scipy.linalg.solve_triangular(
             L.T,
             jax.scipy.linalg.solve_triangular(L, y, lower=True),
