@@ -602,28 +602,20 @@ class PCMCI:
 
                             for start, end in chunk_ranges:
                                 batch_specs = specs[start:end]
-
-                                i_list = []
-                                j_list = []
-                                tau_list = []
-                                cond_vars_list = []
-                                cond_lags_list = []
-
-                                for j_idx, parent, tau, subset in batch_specs:
-                                    i_list.append(parent[0])
-                                    j_list.append(j_idx)
-                                    tau_list.append(tau)
-
-                                    c_vars = [p[0] for p in subset]
-                                    c_lags = [-p[1] for p in subset]
-                                    cond_vars_list.append(c_vars)
-                                    cond_lags_list.append(c_lags)
-
-                                i_arr = jnp.asarray(i_list, dtype=jnp.int32)
-                                j_arr = jnp.asarray(j_list, dtype=jnp.int32)
-                                tau_arr = jnp.asarray(tau_list, dtype=jnp.int32)
-                                cond_vars = jnp.asarray(cond_vars_list, dtype=jnp.int32)
-                                cond_lags = jnp.asarray(cond_lags_list, dtype=jnp.int32)
+                                
+                                # Optimized unpacking using zip and numpy
+                                j_list, parent_tuples, tau_list, subset_tuples = zip(*batch_specs)
+                                i_list = [p[0] for p in parent_tuples]
+                                
+                                i_arr = jnp.array(i_list, dtype=jnp.int32)
+                                j_arr = jnp.array(j_list, dtype=jnp.int32)
+                                tau_arr = jnp.array(tau_list, dtype=jnp.int32)
+                                
+                                # Convert subsets (tuples of (var, -lag)) to array
+                                # Shape: (batch, cond_dim, 2)
+                                subset_arr = np.array(subset_tuples, dtype=np.int32)
+                                cond_vars = jnp.array(subset_arr[:, :, 0], dtype=jnp.int32)
+                                cond_lags = jnp.array(-subset_arr[:, :, 1], dtype=jnp.int32)
 
                                 X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
                                     i_arr, j_arr, tau_arr, cond_vars, cond_lags, max_lag=max_lag
@@ -766,19 +758,19 @@ class PCMCI:
                         ]
 
                     for start, end in chunk_ranges:
-                        cond_vars_list = []
-                        cond_lags_list = []
-                        for subset in subsets_group[start:end]:
-                            condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
-                            cond_vars_list.append([var for var, _ in condition_indices])
-                            cond_lags_list.append([lag for _, lag in condition_indices])
+                        # Optimized subset unpacking
+                        current_subsets = subsets_group[start:end]
+                        
+                        # Convert to numpy array: (batch, cond_dim, 2)
+                        # entries are (var, neg_lag)
+                        subset_arr = np.array(current_subsets, dtype=np.int32)
+                        cond_vars = jnp.array(subset_arr[:, :, 0], dtype=jnp.int32)
+                        cond_lags = jnp.array(-subset_arr[:, :, 1], dtype=jnp.int32)
 
                         batch_len = end - start
                         i_arr = jnp.full((batch_len,), i, dtype=jnp.int32)
                         j_arr = jnp.full((batch_len,), j, dtype=jnp.int32)
                         tau_arr = jnp.full((batch_len,), tau, dtype=jnp.int32)
-                        cond_vars = jnp.asarray(cond_vars_list, dtype=jnp.int32)
-                        cond_lags = jnp.asarray(cond_lags_list, dtype=jnp.int32)
 
                         X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
                             i_arr,

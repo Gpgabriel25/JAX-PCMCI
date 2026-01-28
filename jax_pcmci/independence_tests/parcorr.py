@@ -107,44 +107,52 @@ def _compute_correlation_jit(X: jax.Array, Y: jax.Array) -> jax.Array:
 
 
 @jax.jit
-def _compute_residual_jit(target: jax.Array, predictors: jax.Array) -> jax.Array:
-    """
-    Compute OLS residuals (standalone JITted version).
-    """
-    # Ensure 2D
-    predictors = jnp.atleast_2d(predictors)
-    if predictors.shape[0] == 1 and predictors.shape[1] != target.shape[0]:
-        predictors = predictors.T
-
-    # Center data to avoid adding intercept column (saves memory/compute)
-    target_c = target - jnp.mean(target)
-    predictors_c = predictors - jnp.mean(predictors, axis=0)
-
-    # Solve normal equations: (Z^T Z) beta = Z^T y
-    gram = predictors_c.T @ predictors_c
-    
-    # Regularization for numerical stability
-    ridge = 1e-6 * jnp.eye(gram.shape[0], dtype=gram.dtype)
-    
-    # Compute coefficients
-    rhs = predictors_c.T @ target_c
-    coeffs = linalg.solve(gram + ridge, rhs, assume_a='pos')
-
-    # Compute residuals
-    predicted = predictors_c @ coeffs
-    residual = target_c - predicted
-
-    return residual
-
-
-@jax.jit
 def _compute_partial_correlation_jit(X: jax.Array, Y: jax.Array, Z: jax.Array) -> jax.Array:
     """
     Compute partial correlation via OLS residuals (standalone JITted version).
+    Optimized to reuse Cholesky factorization for X and Y regressions.
     """
-    X_residual = _compute_residual_jit(X, Z)
-    Y_residual = _compute_residual_jit(Y, Z)
-    return _compute_correlation_jit(X_residual, Y_residual)
+    # Ensure Z is 2D
+    Z = jnp.atleast_2d(Z)
+    if Z.shape[0] == 1 and Z.shape[1] != X.shape[0]:
+        Z = Z.T
+        
+    # Center data
+    Z_c = Z - jnp.mean(Z, axis=0)
+    X_c = X - jnp.mean(X)
+    Y_c = Y - jnp.mean(Y)
+    
+    # Solve normal equations: (Z^T Z) beta = Z^T target
+    # We factorize Z^T Z once and use it for both X and Y
+    gram = Z_c.T @ Z_c
+    ridge = 1e-6 * jnp.eye(gram.shape[0], dtype=gram.dtype)
+    
+    # Cholesky factorization
+    # (c, lower) is the format used by cho_solve
+    # c is the factor, lower=True means L in LL^T
+    L_and_lower = linalg.cho_factor(gram + ridge, lower=True)
+    
+    # Regress X on Z
+    rhs_X = Z_c.T @ X_c
+    coeffs_X = linalg.cho_solve(L_and_lower, rhs_X)
+    rX = X_c - Z_c @ coeffs_X
+    
+    # Regress Y on Z
+    rhs_Y = Z_c.T @ Y_c
+    coeffs_Y = linalg.cho_solve(L_and_lower, rhs_Y)
+    rY = Y_c - Z_c @ coeffs_Y
+    
+    # Compute correlation of centered residuals
+    num = jnp.sum(rX * rY)
+    den = jnp.sqrt(jnp.sum(rX**2) * jnp.sum(rY**2))
+    
+    correlation = jnp.where(
+        den > 1e-10,
+        num / den,
+        0.0
+    )
+    
+    return jnp.clip(correlation, -1.0, 1.0)
 
 
 # Vectorized batch versions for maximum GPU throughput

@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from functools import partial
 from itertools import combinations
@@ -374,41 +375,117 @@ class PCMCIPlus(PCMCI):
                     for edge in edges_to_remove:
                         skeleton[j].discard(edge)
             else:
-                # Original sequential code path
-                for j in self.selected_variables:
-                    current_adj = list(skeleton_snapshot[j])
+                # Cond_dim > 0: Optimize with batching if available
+                if hasattr(self.test, 'run_batch'):
+                    specs_by_lag = {}
 
-                    if len(current_adj) <= cond_dim:
-                        continue
+                    for j in self.selected_variables:
+                        current_adj = list(skeleton_snapshot[j])
+                        if len(current_adj) <= cond_dim:
+                            continue
 
-                    edges_to_remove = []
+                        for adj in current_adj:
+                            i, neg_tau = adj
+                            tau = -neg_tau
+                            other_adj = [a for a in current_adj if a != adj]
 
-                    for adj in current_adj:
-                        i, neg_tau = adj
-                        tau = -neg_tau
+                            if len(other_adj) < cond_dim:
+                                continue
 
-                        # Get other adjacent nodes as potential conditioning set
-                        other_adj = [a for a in current_adj if a != adj]
+                            # Test with ALL subsets of size cond_dim (PC-stable standard)
+                            # Note: For very large sets, this could explode, but typical PCMCI usage involves
+                            # sparse graphs or limited max_conds_dim.
+                            for subset in combinations(other_adj, cond_dim):
+                                max_lag_in_subset = max(-p[1] for p in subset) if subset else 0
+                                effective_max_lag = max(tau, max_lag_in_subset)
+                                if effective_max_lag not in specs_by_lag:
+                                    specs_by_lag[effective_max_lag] = []
+                                specs_by_lag[effective_max_lag].append((j, adj, tau, subset))
 
-                        # Test with subsets of size cond_dim
-                        independent, sep_set = self._test_independence_with_subsets(
-                            i=i,
-                            j=j,
-                            tau=tau,
-                            other_adj=other_adj,
-                            cond_dim=cond_dim,
-                            pc_alpha=pc_alpha,
+                    # Process batches grouped by max_lag
+                    for max_lag, specs in specs_by_lag.items():
+                        effective_T = self.T - max_lag
+                        batch_size = self._get_effective_batch_size(
+                            n_samples=effective_T, n_conditions=cond_dim
                         )
 
-                        if independent:
-                            edges_to_remove.append(adj)
-                            # Store separating set
-                            sepsets[(i, j, tau)] = sep_set
-                            sepsets[(j, i, -tau)] = sep_set  # Symmetric
-                            any_removed = True
+                        if batch_size is None or batch_size > len(specs):
+                            chunk_ranges = [(0, len(specs))]
+                        else:
+                            chunk_ranges = [
+                                (start, min(start + batch_size, len(specs)))
+                                for start in range(0, len(specs), batch_size)
+                            ]
 
-                    for edge in edges_to_remove:
-                        skeleton[j].discard(edge)
+                        for start, end in chunk_ranges:
+                            batch_specs = specs[start:end]
+                            j_list, adj_edges, tau_list, subset_list = zip(*batch_specs)
+
+                            i_list = [p[0] for p in adj_edges]
+                            i_arr = jnp.asarray(i_list, dtype=jnp.int32)
+                            j_arr = jnp.asarray(j_list, dtype=jnp.int32)
+                            tau_arr = jnp.asarray(tau_list, dtype=jnp.int32)
+
+                            # Handle subsets -> numpy for speed
+                            subset_arr = np.array(subset_list, dtype=np.int32)
+                            cond_vars = jnp.array(subset_arr[:, :, 0], dtype=jnp.int32)
+                            cond_lags = jnp.array(-subset_arr[:, :, 1], dtype=jnp.int32)
+
+                            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                                i_arr, j_arr, tau_arr, cond_vars, cond_lags, max_lag=max_lag
+                            )
+
+                            stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
+
+                            for idx, pval in enumerate(pvals):
+                                if float(pval) > pc_alpha:
+                                    j_idx = j_list[idx]
+                                    adj_edge = adj_edges[idx]
+                                    tau_val = tau_list[idx]
+                                    subset_val = subset_list[idx]
+
+                                    if adj_edge in skeleton[j_idx]:
+                                        skeleton[j_idx].discard(adj_edge)
+                                        # Store separating set
+                                        sepsets[(adj_edge[0], j_idx, tau_val)] = set(subset_val)
+                                        sepsets[(j_idx, adj_edge[0], -tau_val)] = set(subset_val)
+                                        any_removed = True
+                else:
+                    # Original sequential code path fallback
+                    for j in self.selected_variables:
+                        current_adj = list(skeleton_snapshot[j])
+
+                        if len(current_adj) <= cond_dim:
+                            continue
+
+                        edges_to_remove = []
+
+                        for adj in current_adj:
+                            i, neg_tau = adj
+                            tau = -neg_tau
+
+                            # Get other adjacent nodes as potential conditioning set
+                            other_adj = [a for a in current_adj if a != adj]
+
+                            # Test with subsets of size cond_dim
+                            independent, sep_set = self._test_independence_with_subsets(
+                                i=i,
+                                j=j,
+                                tau=tau,
+                                other_adj=other_adj,
+                                cond_dim=cond_dim,
+                                pc_alpha=pc_alpha,
+                            )
+
+                            if independent:
+                                edges_to_remove.append(adj)
+                                # Store separating set
+                                sepsets[(i, j, tau)] = sep_set
+                                sepsets[(j, i, -tau)] = sep_set  # Symmetric
+                                any_removed = True
+
+                        for edge in edges_to_remove:
+                            skeleton[j].discard(edge)
 
             if not any_removed:
                 break
