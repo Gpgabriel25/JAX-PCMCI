@@ -38,6 +38,7 @@ Example
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -429,6 +430,121 @@ class PCMCI:
 
         return results
 
+    def _get_active_tests_vectorized(
+        self,
+        snapshot_mask: jax.Array,
+        active_links: jax.Array,
+        valid_mask: jax.Array,
+        cond_dim: int,
+        max_subsets: int,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """
+        Generate test specifications for all active links in parallel.
+        
+        Returns
+        -------
+        Tuple of (i_arr, j_arr, tau_arr, subsets_arr)
+        """
+        # active_links is padded, valid_mask indicates real links
+        n_links = active_links.shape[0]
+        
+        # Unpack active links
+        i_arr = active_links[:, 0]
+        j_arr = active_links[:, 1]
+        tau_arr = active_links[:, 2]
+        
+        if cond_dim == 0:
+            return i_arr, j_arr, tau_arr, jnp.zeros((n_links, 0, 2), dtype=jnp.int32)
+            
+        # For each link, we need to sample subsets from OTHER parents of j
+        # parents_mask shape: (N, N, tau_max+1)
+        
+        def sample_for_link(idx):
+            # Check validity
+            is_valid_link = valid_mask[idx]
+            
+            # We must run the logic to maintain shape, but can short-circuit or mask result
+            # However, JAX vmap requires same control flow. 
+            # We use lax.cond to handle invalid links by returning dummy 
+            # but we must ensure we don't access out of bounds or error.
+            # active_links should be padded with valid indices (e.g. 0,0,0)
+            
+            i, j, tau = i_arr[idx], j_arr[idx], tau_arr[idx]
+            
+            # Get potential parents indices for target j
+            # slice shape: (N, tau_max+1)
+            target_parents_mask = snapshot_mask[:, j, :]
+            
+            # Flatten mask to sample indices
+            flat_mask = target_parents_mask.reshape(-1) # Size N*(tau_max+1)
+            
+            # Set current parent (i, tau) to False
+            current_flat_idx = i * (snapshot_mask.shape[2]) + tau
+            flat_mask = flat_mask.at[current_flat_idx].set(False)
+            
+            # Get indices where mask is True
+            potential_indices = jnp.arange(flat_mask.shape[0])
+            
+            # Count valid parents
+            n_potential = jnp.sum(flat_mask)
+            
+            # If not valid link OR not enough parents, return invalid
+            def get_subsets():
+                # We need to sample 'max_subsets' of size 'cond_dim'
+                # Strategy: Use Gumbel-Top-K or iterative sampling if exact enumeration isn't needed.
+                # Here we use a simplified random choice with replacement (checking uniqueness loop is hard in pure JAX)
+                # or just accept collisions for performance in this randomized approx.
+                
+                # To get unique subsets in JAX is tricky. 
+                # We will restart the RNG seeder based on link ID to get deterministic behavior per link
+                key = jax.random.PRNGKey(idx * 12345 + cond_dim)
+                
+                # We want to sample 'cond_dim' elements 'max_subsets' times.
+                # p = flat_mask / sum(flat_mask)
+                p = flat_mask.astype(jnp.float32)
+                p = p / (jnp.sum(p) + 1e-10)
+                
+                # Sample (max_subsets, cond_dim) indices
+                # Note: choice with replace=False is hard for batching if populations differ.
+                # We use replace=True and maybe filter? Or just replace=False if supported?
+                # jax.random.choice only supports replace=False for 1D.
+                
+                # Workaround: For the randomized phase, we might just pick random parents.
+                # Implementing a fully vectorized unique-subset sampler is advanced.
+                # Fallback: We proceed with a slightly simplified logic where we assume 
+                # we can sample independent indices.
+                
+                # Let's map flattened indices back to (var, lag)
+                keys = jax.random.split(key, max_subsets)
+                
+                def sample_one_subset(k):
+                     return jax.random.choice(k, potential_indices, shape=(cond_dim,), p=p, replace=False)
+                     
+                sampled_flat_indices = jax.vmap(sample_one_subset)(keys)
+                
+                # Convert back to (var, lag)
+                # lag = idx % (tau_max+1)
+                # var = idx // (tau_max+1)
+                n_lags = snapshot_mask.shape[2]
+                subset_lags = sampled_flat_indices % n_lags
+                subset_vars = sampled_flat_indices // n_lags
+                
+                # Stack to (max_subsets, cond_dim, 2)
+                return jnp.stack([subset_vars, subset_lags], axis=-1).astype(jnp.int32)
+
+            # Conditional: if valid link AND enough parents, get subsets, else zeros
+            # Note: The logic "if len(potential_parents) < cond_dim" needs to be checked dynamically
+            return jax.lax.cond(
+                jnp.logical_and(is_valid_link, n_potential >= cond_dim),
+                get_subsets,
+                lambda: jnp.zeros((max_subsets, cond_dim, 2), dtype=jnp.int32) - 1 # Mark invalid
+            )
+
+        # Vmap over all active links
+        subsets_all = jax.vmap(sample_for_link)(jnp.arange(n_links))
+        
+        return i_arr, j_arr, tau_arr, subsets_all
+
     def run_pc_stable(
         self,
         tau_max: int = 1,
@@ -438,234 +554,215 @@ class PCMCI:
         max_subsets: int = 100,
     ) -> Dict[int, Set[Tuple[int, int]]]:
         """
-        Run the PC-stable condition selection algorithm.
-
-        For each target variable, iteratively tests potential parents
-        and removes those that are conditionally independent given
-        subsets of other potential parents.
-
-        Parameters
-        ----------
-        tau_max : int, default=1
-            Maximum time lag.
-        tau_min : int, default=1
-            Minimum time lag.
-        pc_alpha : float or None, default=0.05
-            Significance level. If None, keeps all parents.
-        max_conds_dim : int or None
-            Maximum conditioning set dimension.
-        max_subsets : int, default=100
-            Maximum number of conditioning subsets to test per parent.
-            Randomly samples if more subsets are available.
-
-        Returns
-        -------
-        dict
-            Dictionary mapping each variable index to its set of
-            parents as (variable, lag) tuples.
-
-        Examples
-        --------
-        >>> parents = pcmci.run_pc_stable(tau_max=3, pc_alpha=0.05)
-        >>> print(f"Parents of X0: {parents[0]}")
-
-        Notes
-        -----
-        This implements the "stable" version of PC, where the removal
-        decisions are made based on the parents at the start of each
-        iteration, not the current (changing) parent set.
+        Run the PC-stable condition selection algorithm (Vectorized Phase 2).
         """
-        parents: Dict[int, Set[Tuple[int, int]]] = {}
-
-        # Initialize: all lagged variables are potential parents
-        for j in self.selected_variables:
-            parents[j] = set()
-            for i in range(self.N):
-                for tau in range(tau_min, tau_max + 1):
-                    # Include all (i, -tau) as potential parents of j
-                    # except (j, 0) which is the target itself
-                    if not (i == j and tau == 0):
-                        parents[j].add((i, -tau))
-
+        # Initialization
+        parents_mask = jnp.ones((self.N, self.N, tau_max + 1), dtype=bool)
+        parents_mask = parents_mask.at[jnp.arange(self.N), jnp.arange(self.N), 0].set(False)
+        if tau_min > 0:
+            parents_mask = parents_mask.at[:, :, :tau_min].set(False)
+        
         if pc_alpha is None:
-            # No selection - keep all parents
-            return parents
+            return self._mask_to_dict(parents_mask)
 
-        # Iteratively increase conditioning set size
-        cond_dim = 0
         max_dim = max_conds_dim if max_conds_dim is not None else self.N * tau_max
-
         iterator = range(max_dim + 1)
         if self.verbosity >= 1:
             iterator = tqdm(iterator, desc="PC iterations", leave=False)
 
+        # Pre-calculate fixed size for padding
+        # Max possible links is roughly len(selected) * N * (tau_max+1)
+        # We use a conservative upper bound
+        n_selected = len(self.selected_variables)
+        max_links_fixed = n_selected * self.N * (tau_max + 1)
+
         for cond_dim in iterator:
-            # Store parents at start of iteration (stable PC)
-            parents_snapshot = {j: parents[j].copy() for j in self.selected_variables}
-            any_removed = False
-
-            # Check if we can use batch optimization
-            if hasattr(self.test, 'run_batch'):
-                # Global batching: collect tests from ALL variables first
-                # specs_by_lag stores: (j, parent, tau, subset)
-                specs_by_lag: Dict[int, List[Tuple[int, Tuple[int, int], int, Tuple[Tuple[int, int], ...]]]] = {}
-
-                for j in self.selected_variables:
-                    current_parents = list(parents_snapshot[j])
-                    if not current_parents:
-                        continue
-
-                    if cond_dim == 0:
-                        # Unconditional optimization
-                        for parent in current_parents:
-                            i, neg_tau = parent
-                            tau = -neg_tau
-                            
-                            if tau not in specs_by_lag:
-                                specs_by_lag[tau] = []
-                            # Empty subset for cond_dim=0
-                            specs_by_lag[tau].append((j, parent, tau, tuple()))
-                    
-                    else:
-                        # Conditional optimization
-                        if len(current_parents) <= cond_dim:
-                            continue
-                            
-                        for parent in current_parents:
-                            i, neg_tau = parent
-                            tau = -neg_tau
-                            
-                            other_parents = [p for p in current_parents if p != parent]
-                            if len(other_parents) < cond_dim:
-                                continue
-
-                            subsets_to_test = self._sample_condition_subsets(
-                                other_parents,
-                                cond_dim,
-                                max_subsets,
-                                seed=i * 1000 + j * 100 + tau + cond_dim,
-                            )
-
-                            for subset in subsets_to_test:
-                                max_lag_in_subset = max(-p[1] for p in subset) if subset else 0
-                                effective_max_lag = max(tau, max_lag_in_subset)
-                                if effective_max_lag not in specs_by_lag:
-                                    specs_by_lag[effective_max_lag] = []
-                                specs_by_lag[effective_max_lag].append((j, parent, tau, subset))
-
-                # Now run all collected tests in optimal batches
-                parents_to_remove_global = set() # Store (j, parent) tuples
+            snapshot_mask = parents_mask # JAX array, no need to copy as it's immutable
+            
+            # Identify active links
+            # (i, j, tau) indices
+            active_links_indices = jnp.argwhere(snapshot_mask)
+            
+            # Filter for selected targets (still need this check as we iterate active links)
+            # Efficiently filtering in JAX:
+            # Create mask of selected targets
+            target_mask = jnp.zeros(self.N, dtype=bool)
+            target_mask = target_mask.at[jnp.array(list(self.selected_variables))].set(True)
+            
+            # active_links_indices: (K, 3) where column 1 is j
+            # Keep rows where target_mask[j] is True
+            j_indices = active_links_indices[:, 1]
+            rows_to_keep = target_mask[j_indices]
+            
+            active_links_dynamic = active_links_indices[rows_to_keep]
+            n_active = active_links_dynamic.shape[0]
+            
+            if n_active == 0:
+                break
                 
-                sorted_lags = sorted(specs_by_lag.keys())
-                for max_lag in sorted_lags:
-                    specs = specs_by_lag[max_lag]
-                    
-                    effective_T = self.T - max_lag
-                    batch_size = self._get_effective_batch_size(
-                        n_samples=effective_T, n_conditions=cond_dim
-                    )
-
-                    if batch_size is None or batch_size > len(specs):
-                        chunk_ranges = [(0, len(specs))]
-                    else:
-                        chunk_ranges = [
-                            (start, min(start + batch_size, len(specs)))
-                            for start in range(0, len(specs), batch_size)
-                        ]
-
-                    for start, end in chunk_ranges:
-                        batch_specs = specs[start:end]
-                        
-                        # Optimized unpacking
-                        j_list, parent_tuples, tau_list, subset_tuples = zip(*batch_specs)
-                        i_list = [p[0] for p in parent_tuples]
-                        
-                        i_arr = jnp.array(i_list, dtype=jnp.int32)
-                        j_arr = jnp.array(j_list, dtype=jnp.int32)
-                        tau_arr = jnp.array(tau_list, dtype=jnp.int32)
-                        
-                        if cond_dim > 0:
-                            # Shape: (batch, cond_dim, 2)
-                            subset_arr = np.array(subset_tuples, dtype=np.int32)
-                            cond_vars = jnp.array(subset_arr[:, :, 0], dtype=jnp.int32)
-                            cond_lags = jnp.array(-subset_arr[:, :, 1], dtype=jnp.int32)
-                            
-                            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                                i_arr, j_arr, tau_arr, cond_vars, cond_lags, max_lag=max_lag
-                            )
-                        else:
-                            # Cond_dim = 0
-                            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                                i_arr, j_arr, tau_arr, max_lag=max_lag
-                            )
-
-                        stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
-
-                        # Check for independence
-                        independent_mask = np.asarray(pvals > pc_alpha)
-                        for idx in np.where(independent_mask)[0]:
-                            j_idx = batch_specs[idx][0]
-                            p_idx = batch_specs[idx][1]
-                            parents_to_remove_global.add((j_idx, p_idx))
-                            any_removed = True
+            # Pad active_links to fixed size to avoid recompilation
+            # We act on max_links_fixed or slightly larger if needed
+            # Ensure we don't exceed - handled by dynamic shape in non-padded approach,
+            # but here we force padding.
+            
+            if n_active > max_links_fixed:
+                # Should not happen given the bound logic, but for safety:
+                max_links_fixed = n_active 
                 
-                # Apply removals
-                for j_idx, p_idx in parents_to_remove_global:
-                    parents[j_idx].discard(p_idx)
+            padding_len = max_links_fixed - n_active
+            
+            # Create padded arrays
+            # Pad with 0 (valid index) but mask out via valid_mask
+            if padding_len > 0:
+                active_links_padded = jnp.pad(active_links_dynamic, ((0, padding_len), (0, 0)), mode='constant', constant_values=0)
+                valid_mask = jnp.concatenate([jnp.ones(n_active, dtype=bool), jnp.zeros(padding_len, dtype=bool)])
+            else:
+                active_links_padded = active_links_dynamic
+                valid_mask = jnp.ones(n_active, dtype=bool)
+
+            # If cond_dim > 0, check if we can stop early (no node has enough parents)
+            # Calculate degree per node
+            degrees = jnp.sum(snapshot_mask, axis=(0, 2)) # Shape (N,)
+            max_degree = jnp.max(degrees)
+            if cond_dim > 0 and max_degree < cond_dim:
+                # We can technically stop here if strictly following PC, 
+                # but let's just continue to be safe or break
+                pass 
+
+            # Generate tests fully vectorized
+            if cond_dim == 0:
+                # Simple case: 1 test per link
+                # We can just process dynamic links directly here as this step is usually fast or matches padded
+                # But to rely on padding consistency, let's use the padded arrays but filter before run_batch?
+                # Actually run_batch for cond_dim=0 is best done on dynamic shape or masked?
+                # DataHandler handles dynamic shapes fine.
+                # Let's use dynamic shape for cond_dim=0 as it is only 1 iteration, no loop recompilation problem usually 
+                # (cond_dim=0 is always first step)
                 
-                if self.verbosity >= 2 and parents_to_remove_global:
-                    print(f"  Removed {len(parents_to_remove_global)} parents across all variables (cond_dim={cond_dim})")
+                i_arr = active_links_dynamic[:, 0]
+                j_arr = active_links_dynamic[:, 1]
+                tau_arr = active_links_dynamic[:, 2]
+                
+                # Run batch
+                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                    i_arr, j_arr, tau_arr, None, None, max_lag=tau_max
+                )
+                
+                stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
+                
+                # Check significant
+                is_indep = pvals > pc_alpha
+                
+                # Remove links
+                # indices to remove: active_links[is_indep]
+                links_to_remove = active_links_dynamic[is_indep]
+                if links_to_remove.shape[0] > 0:
+                     parents_mask = parents_mask.at[links_to_remove[:, 0], links_to_remove[:, 1], links_to_remove[:, 2]].set(False)
 
             else:
-                # Sequential fallback (CPU/No-batch-support)
-                    # Sequential fallback
-                    for j in self.selected_variables:
-                        current_parents = list(parents_snapshot[j])
-
-                        if len(current_parents) <= cond_dim:
-                            continue
-
-                        # Test each parent
-                        parents_to_remove = []
-
-                        for parent in current_parents:
-                            i, neg_tau = parent
-                            tau = -neg_tau
-
-                            # Get possible conditioning sets (subsets of other parents)
-                            other_parents = [p for p in current_parents if p != parent]
-
-                            # Test with subsets of size cond_dim
-                            if len(other_parents) >= cond_dim:
-                                is_independent = self._test_with_conditioning_subsets(
-                                    i=i,
-                                    j=j,
-                                    tau=tau,
-                                    other_parents=other_parents,
-                                    cond_dim=cond_dim,
-                                    pc_alpha=pc_alpha,
-                                    max_subsets=max_subsets,
-                                )
-
-                                if is_independent:
-                                    parents_to_remove.append(parent)
-                                    any_removed = True
-
-                        # Remove independent parents
-                        for parent in parents_to_remove:
-                            parents[j].discard(parent)
-
-                        if self.verbosity >= 2 and parents_to_remove:
-                            print(f"  Removed {len(parents_to_remove)} parents from X{j}")
-
-            if not any_removed:
-                # No removals - algorithm converged
-                break
+                # Conditional case - Use padding to stabilize shapes
+                i_arr, j_arr, tau_arr, subsets_all = self._get_active_tests_vectorized(
+                    snapshot_mask, active_links_padded, valid_mask, cond_dim, max_subsets
+                )
+                
+                # subsets_all: (max_links_fixed, max_subsets, cond_dim, 2)
+                
+                n_links_p, n_subs, _, _ = subsets_all.shape
+                
+                # Reshape for batch run
+                i_flat = jnp.repeat(i_arr, n_subs)
+                j_flat = jnp.repeat(j_arr, n_subs)
+                tau_flat = jnp.repeat(tau_arr, n_subs)
+                
+                subsets_flat = subsets_all.reshape(-1, cond_dim, 2)
+                
+                # Filter out invalid subsets 
+                # (Both masked from padding AND invalid returns from subset sampling)
+                valid_tests_mask = subsets_flat[:, 0, 0] != -1
+                
+                if jnp.sum(valid_tests_mask) == 0:
+                    continue
+                    
+                i_run = i_flat[valid_tests_mask]
+                j_run = j_flat[valid_tests_mask]
+                tau_run = tau_flat[valid_tests_mask]
+                subsets_run = subsets_flat[valid_tests_mask]
+                
+                # Now we have a massive batch of tests.
+                total_tests = i_run.shape[0]
+                chunk_size = 50000 
+                
+                is_independent_link_padded = jnp.zeros(n_links_p, dtype=bool)
+                
+                # Map back to padded index
+                original_indices = jnp.arange(n_links_p).repeat(n_subs)[valid_tests_mask]
+                
+                for k in range(0, total_tests, chunk_size):
+                    end = min(k + chunk_size, total_tests)
+                    
+                    i_c = i_run[k:end]
+                    j_c = j_run[k:end]
+                    tau_c = tau_run[k:end]
+                    subs_c = subsets_run[k:end]
+                    
+                    cond_vars = subs_c[:, :, 0]
+                    cond_lags = subs_c[:, :, 1]
+                    
+                    # Ensure integer types
+                    i_c = i_c.astype(jnp.int32)
+                    j_c = j_c.astype(jnp.int32)
+                    tau_c = tau_c.astype(jnp.int32)
+                    cond_vars = cond_vars.astype(jnp.int32)
+                    cond_lags = cond_lags.astype(jnp.int32)
+                    
+                    X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                        i_c, j_c, tau_c, cond_vars, cond_lags, max_lag=tau_max
+                    )
+                    
+                    # Run test
+                    _, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
+                    
+                    # Check independence
+                    indep_c = pvals > pc_alpha
+                    
+                    # Update status
+                    batch_orig_indices = original_indices[k:end]
+                    found_indep_indices = batch_orig_indices[indep_c]
+                    
+                    if found_indep_indices.shape[0] > 0:
+                        is_independent_link_padded = is_independent_link_padded.at[found_indep_indices].set(True)
+                        
+                # Identify valid links that are independent
+                # Must be valid (in valid_mask) AND found independent
+                final_remove_mask = jnp.logical_and(is_independent_link_padded, valid_mask)
+                
+                links_to_remove = active_links_padded[final_remove_mask]
+                if links_to_remove.shape[0] > 0:
+                     parents_mask = parents_mask.at[links_to_remove[:, 0], links_to_remove[:, 1], links_to_remove[:, 2]].set(False)
 
         if self.verbosity >= 1:
-            total_parents = sum(len(p) for p in parents.values())
+            total_parents = jnp.sum(parents_mask).item()
             print(f"PC phase complete: {total_parents} total parent links")
 
+        return self._mask_to_dict(parents_mask)
+
+    def _mask_to_dict(self, mask: jax.Array) -> Dict[int, Set[Tuple[int, int]]]:
+        """Convert boolean mask to dictionary of parent sets."""
+        parents = {}
+        # Ensure mask is on CPU for efficient iteration
+        mask_np = np.array(mask)
+        
+        # Iterate over targets
+        for j in self.selected_variables:
+            parents[j] = set()
+            # Find True entries for this target
+            # mask[:, j, :]
+            src_indices, lag_indices = np.where(mask_np[:, j, :])
+            
+            for src, lag in zip(src_indices, lag_indices):
+                # Parents are stored as (i, -tau)
+                parents[j].add((int(src), -int(lag)))
+                
         return parents
 
     def _test_with_conditioning_subsets(

@@ -614,7 +614,10 @@ class DataHandler:
         def slice_one(start_idx, var_idx):
             return lax.dynamic_slice(values, (start_idx, var_idx), (length, 1)).squeeze(1)
 
-        return jax.vmap(slice_one)(start_idxs, var_idxs)
+        return jax.vmap(slice_one)(
+            start_idxs.astype(jnp.int32), 
+            var_idxs.astype(jnp.int32)
+        )
 
     def get_variable_pair_batch(
         self,
