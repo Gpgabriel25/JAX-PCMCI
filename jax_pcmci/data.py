@@ -512,6 +512,9 @@ class DataHandler:
         j: int,
         tau: int,
         condition_indices: Optional[Sequence[Tuple[int, int]]] = None,
+        cond_vars: Optional[Sequence[int]] = None,
+        cond_lags: Optional[Sequence[int]] = None,
+        max_lag: Optional[int] = None,
     ) -> Tuple[jax.Array, jax.Array, Optional[jax.Array]]:
         """
         Get data for testing conditional independence between two variables.
@@ -529,6 +532,14 @@ class DataHandler:
             Time lag from i to j.
         condition_indices : list of (int, int), optional
             List of (variable_index, lag) tuples for conditioning set.
+            Mutually exclusive with cond_vars/cond_lags.
+        cond_vars : list of int, optional
+            Conditioning variable indices. Must be used with cond_lags.
+        cond_lags : list of int, optional
+            Conditioning variable lags. Must be used with cond_vars.
+        max_lag : int, optional
+            Precomputed maximum lag for alignment. If not provided, computed
+            from tau and conditioning set.
 
         Returns
         -------
@@ -546,9 +557,28 @@ class DataHandler:
         ...     i=0, j=1, tau=2,
         ...     condition_indices=[(2, 1), (3, 1)]
         ... )
+        >>> # Or equivalently with separate arrays
+        >>> X, Y, Z = handler.get_variable_pair_data(
+        ...     i=0, j=1, tau=2,
+        ...     cond_vars=[2, 3], cond_lags=[1, 1]
+        ... )
         """
         if tau < 0:
             raise ValueError(f"tau must be non-negative, got {tau}")
+
+        # Handle both API styles
+        if cond_vars is not None or cond_lags is not None:
+            if condition_indices is not None:
+                raise ValueError(
+                    "Cannot specify both condition_indices and cond_vars/cond_lags"
+                )
+            if (cond_vars is None) != (cond_lags is None):
+                raise ValueError(
+                    "cond_vars and cond_lags must both be specified or both be None"
+                )
+            # Convert to condition_indices format for processing
+            if cond_vars is not None:
+                condition_indices = list(zip(cond_vars, cond_lags))
 
         cache_key = None
         if self._pair_cache is not None:
@@ -561,9 +591,13 @@ class DataHandler:
                 return self._pair_cache[cache_key]
 
         # Determine the effective time range
-        max_lag = tau
-        if condition_indices:
-            max_lag = max(max_lag, max(lag for _, lag in condition_indices))
+        if max_lag is not None:
+            # Use precomputed max_lag if provided
+            pass
+        else:
+            max_lag = tau
+            if condition_indices:
+                max_lag = max(max_lag, max(lag for _, lag in condition_indices))
 
         effective_T = self.T - max_lag
         if effective_T <= 0:
@@ -600,6 +634,7 @@ class DataHandler:
                 self._pair_cache.popitem(last=False)
 
         return X, Y, Z
+
 
     @staticmethod
     @partial(jax.jit, static_argnums=(3,))
@@ -667,6 +702,11 @@ class DataHandler:
             return X, Y, None
 
         n_cond = cond_vars.shape[1]
+        
+        # If conditioning set is empty, return None
+        if n_cond == 0:
+            return X, Y, None
+            
         batch_size = cond_vars.shape[0]
         
         # Vectorize over conditioning variables: process all at once

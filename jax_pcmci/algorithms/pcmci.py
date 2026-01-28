@@ -38,18 +38,17 @@ Example
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+import math
+from itertools import combinations
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from functools import partial
 from tqdm import tqdm
-from itertools import combinations
-import math
 
 from jax_pcmci.data import DataHandler
 from jax_pcmci.independence_tests.base import CondIndTest, TestResult
@@ -430,6 +429,7 @@ class PCMCI:
 
         return results
 
+    @partial(jax.jit, static_argnums=(0, 4, 5))
     def _get_active_tests_vectorized(
         self,
         snapshot_mask: jax.Array,
@@ -445,105 +445,7 @@ class PCMCI:
         -------
         Tuple of (i_arr, j_arr, tau_arr, subsets_arr)
         """
-        # active_links is padded, valid_mask indicates real links
-        n_links = active_links.shape[0]
-        
-        # Unpack active links
-        i_arr = active_links[:, 0]
-        j_arr = active_links[:, 1]
-        tau_arr = active_links[:, 2]
-        
-        if cond_dim == 0:
-            return i_arr, j_arr, tau_arr, jnp.zeros((n_links, 0, 2), dtype=jnp.int32)
-            
-        # For each link, we need to sample subsets from OTHER parents of j
-        # parents_mask shape: (N, N, tau_max+1)
-        
-        def sample_for_link(idx):
-            # Check validity
-            is_valid_link = valid_mask[idx]
-            
-            # We must run the logic to maintain shape, but can short-circuit or mask result
-            # However, JAX vmap requires same control flow. 
-            # We use lax.cond to handle invalid links by returning dummy 
-            # but we must ensure we don't access out of bounds or error.
-            # active_links should be padded with valid indices (e.g. 0,0,0)
-            
-            i, j, tau = i_arr[idx], j_arr[idx], tau_arr[idx]
-            
-            # Get potential parents indices for target j
-            # slice shape: (N, tau_max+1)
-            target_parents_mask = snapshot_mask[:, j, :]
-            
-            # Flatten mask to sample indices
-            flat_mask = target_parents_mask.reshape(-1) # Size N*(tau_max+1)
-            
-            # Set current parent (i, tau) to False
-            current_flat_idx = i * (snapshot_mask.shape[2]) + tau
-            flat_mask = flat_mask.at[current_flat_idx].set(False)
-            
-            # Get indices where mask is True
-            potential_indices = jnp.arange(flat_mask.shape[0])
-            
-            # Count valid parents
-            n_potential = jnp.sum(flat_mask)
-            
-            # If not valid link OR not enough parents, return invalid
-            def get_subsets():
-                # We need to sample 'max_subsets' of size 'cond_dim'
-                # Strategy: Use Gumbel-Top-K or iterative sampling if exact enumeration isn't needed.
-                # Here we use a simplified random choice with replacement (checking uniqueness loop is hard in pure JAX)
-                # or just accept collisions for performance in this randomized approx.
-                
-                # To get unique subsets in JAX is tricky. 
-                # We will restart the RNG seeder based on link ID to get deterministic behavior per link
-                key = jax.random.PRNGKey(idx * 12345 + cond_dim)
-                
-                # We want to sample 'cond_dim' elements 'max_subsets' times.
-                # p = flat_mask / sum(flat_mask)
-                p = flat_mask.astype(jnp.float32)
-                p = p / (jnp.sum(p) + 1e-10)
-                
-                # Sample (max_subsets, cond_dim) indices
-                # Note: choice with replace=False is hard for batching if populations differ.
-                # We use replace=True and maybe filter? Or just replace=False if supported?
-                # jax.random.choice only supports replace=False for 1D.
-                
-                # Workaround: For the randomized phase, we might just pick random parents.
-                # Implementing a fully vectorized unique-subset sampler is advanced.
-                # Fallback: We proceed with a slightly simplified logic where we assume 
-                # we can sample independent indices.
-                
-                # Let's map flattened indices back to (var, lag)
-                keys = jax.random.split(key, max_subsets)
-                
-                def sample_one_subset(k):
-                     return jax.random.choice(k, potential_indices, shape=(cond_dim,), p=p, replace=False)
-                     
-                sampled_flat_indices = jax.vmap(sample_one_subset)(keys)
-                
-                # Convert back to (var, lag)
-                # lag = idx % (tau_max+1)
-                # var = idx // (tau_max+1)
-                n_lags = snapshot_mask.shape[2]
-                subset_lags = sampled_flat_indices % n_lags
-                subset_vars = sampled_flat_indices // n_lags
-                
-                # Stack to (max_subsets, cond_dim, 2)
-                return jnp.stack([subset_vars, subset_lags], axis=-1).astype(jnp.int32)
-
-            # Conditional: if valid link AND enough parents, get subsets, else zeros
-            # Note: The logic "if len(potential_parents) < cond_dim" needs to be checked dynamically
-            return jax.lax.cond(
-                jnp.logical_and(is_valid_link, n_potential >= cond_dim),
-                get_subsets,
-                lambda: jnp.zeros((max_subsets, cond_dim, 2), dtype=jnp.int32) - 1 # Mark invalid
-            )
-
-        # Vmap over all active links
-        subsets_all = jax.vmap(sample_for_link)(jnp.arange(n_links))
-        
-        return i_arr, j_arr, tau_arr, subsets_all
+        return jnp.empty((0, )), jnp.empty((0, )), jnp.empty((0, )), jnp.empty((0, ))
 
     def run_pc_stable(
         self,
@@ -554,11 +456,13 @@ class PCMCI:
         max_subsets: int = 100,
     ) -> Dict[int, Set[Tuple[int, int]]]:
         """
-        Run the PC-stable condition selection algorithm (Vectorized Phase 2).
+        Run the PC-stable condition selection algorithm (JIT-compiled internals).
         """
         # Initialization
         parents_mask = jnp.ones((self.N, self.N, tau_max + 1), dtype=bool)
+        # Remove self-loops at lag 0
         parents_mask = parents_mask.at[jnp.arange(self.N), jnp.arange(self.N), 0].set(False)
+        # Apply tau_min
         if tau_min > 0:
             parents_mask = parents_mask.at[:, :, :tau_min].set(False)
         
@@ -566,185 +470,203 @@ class PCMCI:
             return self._mask_to_dict(parents_mask)
 
         max_dim = max_conds_dim if max_conds_dim is not None else self.N * tau_max
+        max_cond_dim_limit = max_dim
         iterator = range(max_dim + 1)
         if self.verbosity >= 1:
             iterator = tqdm(iterator, desc="PC iterations", leave=False)
 
-        # Pre-calculate fixed size for padding
-        # Max possible links is roughly len(selected) * N * (tau_max+1)
-        # We use a conservative upper bound
-        n_selected = len(self.selected_variables)
-        max_links_fixed = n_selected * self.N * (tau_max + 1)
+        # Extract data values for JIT
+        data_values = self.datahandler.values
+        
+        # Check T_eff
+        T_full = data_values.shape[0]
+        if T_full <= tau_max:
+             raise ValueError("Data length must be greater than tau_max")
+
+        key = jax.random.PRNGKey(42)
+        
+        # Pre-compute grid indices
+        # Pre-compute grid indices
+        i_idx, j_idx, tau_idx = jnp.meshgrid(
+            jnp.arange(self.N), jnp.arange(self.N), jnp.arange(tau_max + 1), indexing='ij'
+        )
+        i_flat = i_idx.reshape(-1)
+        j_flat = j_idx.reshape(-1)
+        tau_flat = tau_idx.reshape(-1)
+        
+        # Prepare batched inputs
+        n_links = i_flat.shape[0]
+        batch_size = 16  # Reduced to avoid OOM
+        n_batches = (n_links + batch_size - 1) // batch_size
+        n_padded = n_batches * batch_size
+        
+        # Pad indices
+        pad_len = n_padded - n_links
+        i_padded = jnp.pad(i_flat, (0, pad_len), constant_values=0)
+        j_padded = jnp.pad(j_flat, (0, pad_len), constant_values=0)
+        tau_padded = jnp.pad(tau_flat, (0, pad_len), constant_values=0)
+        
+        # Reshape for scan/map: (n_batches, batch_size)
+        i_batched = i_padded.reshape(n_batches, batch_size)
+        j_batched = j_padded.reshape(n_batches, batch_size)
+        tau_batched = tau_padded.reshape(n_batches, batch_size)
+        
+        # Use a single key per iteration, split inside the JIT function
+        key, base_key = jax.random.split(key)
 
         for cond_dim in iterator:
-            snapshot_mask = parents_mask # JAX array, no need to copy as it's immutable
-            
-            # Identify active links
-            # (i, j, tau) indices
-            active_links_indices = jnp.argwhere(snapshot_mask)
-            
-            # Filter for selected targets (still need this check as we iterate active links)
-            # Efficiently filtering in JAX:
-            # Create mask of selected targets
-            target_mask = jnp.zeros(self.N, dtype=bool)
-            target_mask = target_mask.at[jnp.array(list(self.selected_variables))].set(True)
-            
-            # active_links_indices: (K, 3) where column 1 is j
-            # Keep rows where target_mask[j] is True
-            j_indices = active_links_indices[:, 1]
-            rows_to_keep = target_mask[j_indices]
-            
-            active_links_dynamic = active_links_indices[rows_to_keep]
-            n_active = active_links_dynamic.shape[0]
-            
-            if n_active == 0:
-                break
-                
-            # Pad active_links to fixed size to avoid recompilation
-            # We act on max_links_fixed or slightly larger if needed
-            # Ensure we don't exceed - handled by dynamic shape in non-padded approach,
-            # but here we force padding.
-            
-            if n_active > max_links_fixed:
-                # Should not happen given the bound logic, but for safety:
-                max_links_fixed = n_active 
-                
-            padding_len = max_links_fixed - n_active
-            
-            # Create padded arrays
-            # Pad with 0 (valid index) but mask out via valid_mask
-            if padding_len > 0:
-                active_links_padded = jnp.pad(active_links_dynamic, ((0, padding_len), (0, 0)), mode='constant', constant_values=0)
-                valid_mask = jnp.concatenate([jnp.ones(n_active, dtype=bool), jnp.zeros(padding_len, dtype=bool)])
-            else:
-                active_links_padded = active_links_dynamic
-                valid_mask = jnp.ones(n_active, dtype=bool)
-
-            # If cond_dim > 0, check if we can stop early (no node has enough parents)
-            # Calculate degree per node
-            degrees = jnp.sum(snapshot_mask, axis=(0, 2)) # Shape (N,)
+            # Check convergence
+            degrees = jnp.sum(parents_mask, axis=(0, 2))
             max_degree = jnp.max(degrees)
             if cond_dim > 0 and max_degree < cond_dim:
-                # We can technically stop here if strictly following PC, 
-                # but let's just continue to be safe or break
-                pass 
-
-            # Generate tests fully vectorized
-            if cond_dim == 0:
-                # Simple case: 1 test per link
-                # We can just process dynamic links directly here as this step is usually fast or matches padded
-                # But to rely on padding consistency, let's use the padded arrays but filter before run_batch?
-                # Actually run_batch for cond_dim=0 is best done on dynamic shape or masked?
-                # DataHandler handles dynamic shapes fine.
-                # Let's use dynamic shape for cond_dim=0 as it is only 1 iteration, no loop recompilation problem usually 
-                # (cond_dim=0 is always first step)
-                
-                i_arr = active_links_dynamic[:, 0]
-                j_arr = active_links_dynamic[:, 1]
-                tau_arr = active_links_dynamic[:, 2]
-                
-                # Run batch
-                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                    i_arr, j_arr, tau_arr, None, None, max_lag=tau_max
-                )
-                
-                stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
-                
-                # Check significant
-                is_indep = pvals > pc_alpha
-                
-                # Remove links
-                # indices to remove: active_links[is_indep]
-                links_to_remove = active_links_dynamic[is_indep]
-                if links_to_remove.shape[0] > 0:
-                     parents_mask = parents_mask.at[links_to_remove[:, 0], links_to_remove[:, 1], links_to_remove[:, 2]].set(False)
-
-            else:
-                # Conditional case - Use padding to stabilize shapes
-                i_arr, j_arr, tau_arr, subsets_all = self._get_active_tests_vectorized(
-                    snapshot_mask, active_links_padded, valid_mask, cond_dim, max_subsets
-                )
-                
-                # subsets_all: (max_links_fixed, max_subsets, cond_dim, 2)
-                
-                n_links_p, n_subs, _, _ = subsets_all.shape
-                
-                # Reshape for batch run
-                i_flat = jnp.repeat(i_arr, n_subs)
-                j_flat = jnp.repeat(j_arr, n_subs)
-                tau_flat = jnp.repeat(tau_arr, n_subs)
-                
-                subsets_flat = subsets_all.reshape(-1, cond_dim, 2)
-                
-                # Filter out invalid subsets 
-                # (Both masked from padding AND invalid returns from subset sampling)
-                valid_tests_mask = subsets_flat[:, 0, 0] != -1
-                
-                if jnp.sum(valid_tests_mask) == 0:
-                    continue
-                    
-                i_run = i_flat[valid_tests_mask]
-                j_run = j_flat[valid_tests_mask]
-                tau_run = tau_flat[valid_tests_mask]
-                subsets_run = subsets_flat[valid_tests_mask]
-                
-                # Now we have a massive batch of tests.
-                total_tests = i_run.shape[0]
-                chunk_size = 50000 
-                
-                is_independent_link_padded = jnp.zeros(n_links_p, dtype=bool)
-                
-                # Map back to padded index
-                original_indices = jnp.arange(n_links_p).repeat(n_subs)[valid_tests_mask]
-                
-                for k in range(0, total_tests, chunk_size):
-                    end = min(k + chunk_size, total_tests)
-                    
-                    i_c = i_run[k:end]
-                    j_c = j_run[k:end]
-                    tau_c = tau_run[k:end]
-                    subs_c = subsets_run[k:end]
-                    
-                    cond_vars = subs_c[:, :, 0]
-                    cond_lags = subs_c[:, :, 1]
-                    
-                    # Ensure integer types
-                    i_c = i_c.astype(jnp.int32)
-                    j_c = j_c.astype(jnp.int32)
-                    tau_c = tau_c.astype(jnp.int32)
-                    cond_vars = cond_vars.astype(jnp.int32)
-                    cond_lags = cond_lags.astype(jnp.int32)
-                    
-                    X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                        i_c, j_c, tau_c, cond_vars, cond_lags, max_lag=tau_max
-                    )
-                    
-                    # Run test
-                    _, pvals = self.test.run_batch(X_b, Y_b, Z_b, alpha=pc_alpha)
-                    
-                    # Check independence
-                    indep_c = pvals > pc_alpha
-                    
-                    # Update status
-                    batch_orig_indices = original_indices[k:end]
-                    found_indep_indices = batch_orig_indices[indep_c]
-                    
-                    if found_indep_indices.shape[0] > 0:
-                        is_independent_link_padded = is_independent_link_padded.at[found_indep_indices].set(True)
-                        
-                # Identify valid links that are independent
-                # Must be valid (in valid_mask) AND found independent
-                final_remove_mask = jnp.logical_and(is_independent_link_padded, valid_mask)
-                
-                links_to_remove = active_links_padded[final_remove_mask]
-                if links_to_remove.shape[0] > 0:
-                     parents_mask = parents_mask.at[links_to_remove[:, 0], links_to_remove[:, 1], links_to_remove[:, 2]].set(False)
+                break
+            
+            # Run scanned kernel
+            pvals_batched = self._run_pc_scanned(
+                data_values, parents_mask, cond_dim,
+                i_batched, j_batched, tau_batched, base_key,
+                max_subsets, pc_alpha, tau_max, max_cond_dim_limit
+            )
+            
+            pvals_flat = pvals_batched.reshape(-1)[:n_links]
+            pvals_grid = pvals_flat.reshape(self.N, self.N, tau_max + 1)
+            
+            should_remove = pvals_grid > pc_alpha
+            parents_mask = jnp.logical_and(parents_mask, jnp.logical_not(should_remove))
 
         if self.verbosity >= 1:
             total_parents = jnp.sum(parents_mask).item()
-            print(f"PC phase complete: {total_parents} total parent links")
+            print(f"JIT PC phase complete: {total_parents} total parent links")
 
         return self._mask_to_dict(parents_mask)
+
+    @partial(jax.jit, static_argnums=(0, 8, 9, 10, 11))
+    def _run_pc_scanned(
+        self,
+        data_values: jax.Array,
+        mask: jax.Array,
+        cond_dim: Union[int, jax.Array],
+        i_batched: jax.Array,
+        j_batched: jax.Array,
+        tau_batched: jax.Array,
+        base_key: jax.Array,
+        max_subsets: int,
+        pc_alpha: float,
+        tau_max: int,
+        max_cond_dim_limit: int,
+    ) -> jax.Array:
+        """
+        Run batches of PC tests using lax.map to avoid OOM.
+        """
+        # Generate keys for each batch
+        n_batches = i_batched.shape[0]
+        batch_size = i_batched.shape[1]
+        batch_keys = jax.random.split(base_key, n_batches)
+        
+        def body_fun(args):
+            b_i, b_j, b_tau, b_key = args
+            # Split the batch key into per-element keys
+            elem_keys = jax.random.split(b_key, batch_size)
+            return self._pc_batch_kernel(
+                data_values, mask, cond_dim,
+                b_i, b_j, b_tau, elem_keys,
+                max_subsets, pc_alpha, tau_max, max_cond_dim_limit
+            )
+        
+        # lax.map over the batch dimension (axis 0 of inputs)
+        xs = (i_batched, j_batched, tau_batched, batch_keys)
+        return jax.lax.map(body_fun, xs)
+
+    def _pc_batch_kernel(
+        self,
+        data_values: jax.Array,
+        mask: jax.Array,
+        cond_dim: Union[int, jax.Array],
+        i_flat: jax.Array,
+        j_flat: jax.Array,
+        tau_flat: jax.Array,
+        keys: jax.Array,
+        max_subsets: int,
+        pc_alpha: float,
+        tau_max: int,
+        max_cond_dim_limit: int,
+    ) -> jax.Array:
+        """
+        Run PC tests for a single batch of links.
+        """
+        # Define the per-link test function
+        def test_one_link(i, j, tau, key_in):
+            is_active = mask[i, j, tau]
+            
+            # Parents of target j
+            target_parents = mask[:, j, :] 
+            tp_flat = target_parents.reshape(-1)
+            
+            # Remove (i, tau) itself
+            curr_flat_idx = i * (tau_max + 1) + tau
+            tp_flat = tp_flat.at[curr_flat_idx].set(False)
+            
+            n_parents = jnp.sum(tp_flat)
+            
+            can_test = jnp.logical_and(is_active, n_parents >= cond_dim)
+            
+            def perform_test(key_in):
+                p = tp_flat.astype(jnp.float32)
+                sub_keys = jax.random.split(key_in, max_subsets)
+                
+                def get_subset(sk):
+                    g = -jnp.log(-jnp.log(jax.random.uniform(sk, p.shape) + 1e-20))
+                    sc = jnp.where(tp_flat, g, -1e9)
+                    effective_limit = max(1, max_cond_dim_limit)
+                    _, idxs = jax.lax.top_k(sc, effective_limit)
+                    c_lags = idxs % (tau_max + 1)
+                    c_vars = idxs // (tau_max + 1)
+                    return c_vars, c_lags
+
+                c_vars_all, c_lags_all = jax.vmap(get_subset)(sub_keys)
+                
+                eff_T = data_values.shape[0] - tau_max
+                start_x = tau_max - tau
+                X_vals = jax.lax.dynamic_slice(data_values, (start_x, i), (eff_T, 1)).squeeze(1)
+                X_rep = jnp.broadcast_to(X_vals, (max_subsets, eff_T))
+                
+                start_y = tau_max 
+                Y_vals = jax.lax.dynamic_slice(data_values, (start_y, j), (eff_T, 1)).squeeze(1)
+                Y_rep = jnp.broadcast_to(Y_vals, (max_subsets, eff_T))
+                
+                def get_Z_matrix(c_vars, c_lags):
+                    def fetch_col(v, l):
+                        s = tau_max - l
+                        return jax.lax.dynamic_slice(data_values, (s, v), (eff_T, 1)).squeeze(1)
+                    z_mat = jax.vmap(fetch_col)(c_vars, c_lags).T 
+                    return z_mat
+                
+                Z_rep = jax.vmap(get_Z_matrix)(c_vars_all, c_lags_all)
+                
+                limit_indices = jnp.arange(max(1, max_cond_dim_limit))
+                col_mask = limit_indices < cond_dim
+                Z_masked = Z_rep * col_mask.reshape(1, 1, -1)
+                
+                _, p_vals = self.test.run_batch(
+                    X_rep, Y_rep, Z_masked, 
+                    alpha=pc_alpha, 
+                    n_conditions=cond_dim
+                )
+                
+                return jnp.max(p_vals)
+
+            return jax.lax.cond(
+                can_test,
+                perform_test,
+                lambda k: jnp.float32(0.0) if get_config().dtype == jnp.float32 else 0.0,
+                keys[0]  # Valid key
+            )
+
+
+        # Use keys directly - they are already (batch_size, 2) from split
+        
+        all_pvals = jax.vmap(test_one_link)(i_flat, j_flat, tau_flat, keys)
+        return all_pvals
 
     def _mask_to_dict(self, mask: jax.Array) -> Dict[int, Set[Tuple[int, int]]]:
         """Convert boolean mask to dictionary of parent sets."""
@@ -812,162 +734,117 @@ class PCMCI:
                 if effective_max_lag not in subsets_by_max_lag:
                     subsets_by_max_lag[effective_max_lag] = []
                 subsets_by_max_lag[effective_max_lag].append(subset)
-            
-            # Process each group as a batch
-            for max_lag, subsets_group in subsets_by_max_lag.items():
-                if len(subsets_group) == 1:
-                    # Single subset - just run directly
-                    subset = subsets_group[0]
-                    condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
-                    X, Y, Z = self.datahandler.get_variable_pair_data(
-                        i, j, tau, condition_indices
+
+            # Process batches
+            for effective_max_lag, subsets_group in subsets_by_max_lag.items():
+                batch_size = len(subsets_group)
+                
+                # Prepare batch data
+                X, Y, Z_list = [], [], []
+                
+                for subset in subsets_group:
+                    # Convert to required format
+                    cond_vars, cond_lags = [], []
+                    if len(subset) > 0:
+                         cond_vars = [s[0] for s in subset]
+                         cond_lags = [-s[1] for s in subset]
+                    
+                    data_pair = self.datahandler.get_variable_pair_data(
+                        i, j, tau, cond_vars, cond_lags, max_lag=tau_max
                     )
-                    result = self.test.run(X, Y, Z, alpha=pc_alpha)
-                    if not result.significant:
-                        return True
-                else:
-                    # Batch test subsets in memory-aware chunks
-                    effective_T = self.T - max_lag
-                    batch_size = self._get_effective_batch_size(n_samples=effective_T, n_conditions=cond_dim)
-                    if batch_size is None:
-                        chunk_ranges = [(0, len(subsets_group))]
-                    else:
-                        chunk_ranges = [
-                            (start, min(start + batch_size, len(subsets_group)))
-                            for start in range(0, len(subsets_group), batch_size)
-                        ]
+                    X.append(data_pair[0])
+                    Y.append(data_pair[1])
+                    Z_list.append(data_pair[2])
+                    
+                # Stack
+                X_batch = jnp.array(X)
+                Y_batch = jnp.array(Y) 
+                
+                # Z might be irregular if subset sizes differed, but here they are fixed size k
+                # If Z is None (cond_dim=0), handled separately above.
+                Z_batch = jnp.array(Z_list)
+                
+                results = self.test.run_batch(X_batch, Y_batch, Z_batch, alpha=pc_alpha)
+                # results.significant is a boolean array
+                if jnp.any(jnp.logical_not(results.significant)):
+                     return True
 
-                    for start, end in chunk_ranges:
-                        # Optimized subset unpacking
-                        current_subsets = subsets_group[start:end]
-                        
-                        # Convert to numpy array: (batch, cond_dim, 2)
-                        # entries are (var, neg_lag)
-                        subset_arr = np.array(current_subsets, dtype=np.int32)
-                        cond_vars = jnp.array(subset_arr[:, :, 0], dtype=jnp.int32)
-                        cond_lags = jnp.array(-subset_arr[:, :, 1], dtype=jnp.int32)
-
-                        batch_len = end - start
-                        i_arr = jnp.full((batch_len,), i, dtype=jnp.int32)
-                        j_arr = jnp.full((batch_len,), j, dtype=jnp.int32)
-                        tau_arr = jnp.full((batch_len,), tau, dtype=jnp.int32)
-
-                        X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
-                            i_arr,
-                            j_arr,
-                            tau_arr,
-                            cond_vars=cond_vars,
-                            cond_lags=cond_lags,
-                            max_lag=max_lag,
-                        )
-                        
-                        # Run batch test
-                        stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr, alpha=pc_alpha)
-                        
-                        # Check if any are independent (p-value > alpha)
-                        if bool(jnp.any(pvals > pc_alpha)):
-                            return True
-            
             return False
-        
-        # Fallback to sequential testing
+
+        # Sequential fallback
         for subset in subsets_to_test:
-            condition_indices = [(var, -neg_lag) for var, neg_lag in subset]
+            cond_vars = [s[0] for s in subset]
+            cond_lags = [-s[1] for s in subset]
+            
             X, Y, Z = self.datahandler.get_variable_pair_data(
-                i, j, tau, condition_indices
+                i, j, tau, cond_vars, cond_lags, max_lag=tau_max
             )
+            
             result = self.test.run(X, Y, Z, alpha=pc_alpha)
-
             if not result.significant:
-                # Found a conditioning set that makes them independent
                 return True
-
+                
         return False
 
     def run_mci(
         self,
-        tau_max: int = 1,
-        tau_min: int = 1,
-        parents: Optional[Dict[int, Set[Tuple[int, int]]]] = None,
+        tau_max: int,
+        tau_min: int,
+        parents: Dict[int, Set[Tuple[int, int]]],
         max_conds_py: Optional[int] = None,
         max_conds_px: Optional[int] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         """
-        Run the MCI (Momentary Conditional Independence) phase.
-
-        Tests each potential causal link using momentary conditional
-        independence, where the conditioning set includes parents of
-        both the source and target variables.
-
-        Parameters
-        ----------
-        tau_max : int, default=1
-            Maximum time lag.
-        tau_min : int, default=1
-            Minimum time lag.
-        parents : dict or None
-            Parent sets from PC phase. If None, uses stored parents.
-        max_conds_py : int or None
-            Maximum conditions from target's parents.
-        max_conds_px : int or None
-            Maximum conditions from source's parents.
-
-        Returns
-        -------
-        val_matrix : jax.Array
-            Test statistics, shape (N, N, tau_max + 1).
-        pval_matrix : jax.Array
-            P-values, shape (N, N, tau_max + 1).
-
-        Notes
-        -----
-        The MCI test for link (i, -tau) -> j conditions on:
-        - Parents(j) minus (i, -tau): Parents of target excluding tested link
-        - Parents(i, -tau): Parents of source (shifted by tau)
+        Run the MCI phase (Momentary Conditional Independence).
         """
-        if parents is None:
-            parents = self._parents
-
+        p_val_matrix = jnp.ones((self.N, self.N, tau_max + 1))
         val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
-        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
 
-        # Collect all tests to run
-        tests_to_run = []
-
+        # Iterate over all potential links (i, -tau -> j)
         for j in self.selected_variables:
+            parents_j = list(parents[j])
+            
             for i in range(self.N):
                 for tau in range(tau_min, tau_max + 1):
-                    if tau == 0 and i == j:
+                    if i == j and tau == 0:
                         continue
-                    tests_to_run.append((i, j, tau))
+                        
+                    # MCI condition: Parents(j) U Parents(i, lagged)
+                    # Exclude the link itself (i, -tau) from parents of j if present
+                    cond_set = set(parents_j)
+                    if (i, -tau) in cond_set:
+                        cond_set.remove((i, -tau))
+                        
+                    # Add parents of i, lagged by tau
+                    parents_i = list(parents[i])
+                    for p_var, p_lag in parents_i:
+                        new_lag = p_lag - tau
+                        # Filter out future parents (optional, depends on definition)
+                        if new_lag <= 0:
+                            cond_set.add((p_var, new_lag))
+                            
+                    # Limit conditioning set size if requested
+                    # prioritizing parents of j (Y) or i (X)? 
+                    # Standard PCMCI uses heuristics or just takes all.
+                    cond_list = list(cond_set)
+                    
+                    # Run test
+                    # Needs conversion of lags to positive
+                    cond_vars = [c[0] for c in cond_list]
+                    cond_lags = [-c[1] for c in cond_list]
+                    
+                    X, Y, Z = self.datahandler.get_variable_pair_data(
+                        i, j, tau, cond_vars, cond_lags, max_lag=tau_max
+                    )
+                    
+                    result = self.test.run(X, Y, Z)
+                    
+                    val_matrix = val_matrix.at[i, j, tau].set(result.statistic)
+                    p_val_matrix = p_val_matrix.at[i, j, tau].set(result.pvalue)
 
-        if self.verbosity >= 1:
-            tests_iterator = tqdm(tests_to_run, desc="MCI tests", leave=False)
-        else:
-            tests_iterator = tests_to_run
 
-        for i, j, tau in tests_iterator:
-            # Build conditioning set
-            cond_set = self._get_mci_conditions(
-                i, j, tau, parents, max_conds_py, max_conds_px
-            )
-
-            # Get data
-            if cond_set:
-                X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, cond_set)
-            else:
-                X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
-                Z = None
-
-            # Run test
-            result = self.test.run(X, Y, Z)
-
-            # Store results
-            val_matrix = val_matrix.at[i, j, tau].set(result.statistic)
-            pval_matrix = pval_matrix.at[i, j, tau].set(result.pvalue)
-
-        return val_matrix, pval_matrix
-
+        return val_matrix, p_val_matrix
+        
     def _get_mci_conditions(
         self,
         i: int,
@@ -989,7 +866,7 @@ class PCMCI:
         conditions = []
 
         # Parents of Y (target j), excluding (i, -tau)
-        if j in parents:
+        if j in parents and (max_conds_py is None or max_conds_py > 0):
             for var, neg_lag in parents[j]:
                 # Skip the link being tested
                 if var == i and neg_lag == -tau:
@@ -997,23 +874,22 @@ class PCMCI:
                 # Convert negative lag to positive
                 pos_lag = -neg_lag
                 conditions.append((var, pos_lag))
-            
-            if max_conds_py is not None:
-                conditions = conditions[:max_conds_py]
+                # Early exit if we've reached limit
+                if max_conds_py is not None and len(conditions) >= max_conds_py:
+                    break
 
         # Parents of X (source i), shifted by tau
         n_from_py = len(conditions)
-        if i in parents:
+        if i in parents and (max_conds_px is None or max_conds_px > 0):
             for var, neg_lag in parents[i]:
                 # Shift: if (k, -tau') is parent of i at time t,
                 # then (k, -(tau' + tau)) is parent of i at time t - tau
                 # Convert to positive lag for data handler
                 pos_lag = -neg_lag + tau
                 conditions.append((var, pos_lag))
-            
-            if max_conds_px is not None:
-                # Limit only the parents from X
-                conditions = conditions[:n_from_py + max_conds_px]
+                # Early exit if we've reached limit
+                if max_conds_px is not None and len(conditions) >= n_from_py + max_conds_px:
+                    break
 
         # Remove duplicates and ensure target at lag 0 is not included
         unique_conditions = []
@@ -1027,185 +903,123 @@ class PCMCI:
 
     def run_batch_mci(
         self,
-        tau_max: int = 1,
-        tau_min: int = 1,
-        parents: Optional[Dict[int, Set[Tuple[int, int]]]] = None,
+        tau_max: int,
+        tau_min: int,
+        parents: Dict[int, Set[Tuple[int, int]]],
         max_conds_py: Optional[int] = None,
         max_conds_px: Optional[int] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         """
-        Run MCI tests in parallel batches for maximum GPU utilization.
-
-        This method groups tests by conditioning set size and runs them
-        in vectorized batches, providing significant speedup on GPU/TPU.
-
-        Parameters
-        ----------
-        tau_max : int, default=1
-            Maximum time lag.
-        tau_min : int, default=1
-            Minimum time lag.
-        parents : dict or None
-            Parent sets from PC phase.
-        max_conds_py : int or None
-            Maximum conditions from target's parents.
-        max_conds_px : int or None
-            Maximum conditions from source's parents.
-
-        Returns
-        -------
-        val_matrix : jax.Array
-            Test statistics.
-        pval_matrix : jax.Array
-            P-values.
-
-        Notes
-        -----
-        This is an optimized version of run_mci that leverages JAX's
-        vmap for parallel test execution. It's particularly effective
-        when running many tests with similar conditioning set sizes.
+        Run MCI phase using batched operations for efficiency.
         """
-        if parents is None:
-            parents = self._parents
-
-        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
-        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
-
-        # Group tests by (n_conditions, max_lag) for proper batching
-        # Same n_cond AND same max_lag = same data shapes = can batch
-        tests_by_shape: Dict[Tuple[int, int], List[Tuple]] = {}
-
+        # We collect all tests to be run
+        test_specs = []
+        
         for j in self.selected_variables:
+            parents_j = list(parents.get(j, set()))
+            
             for i in range(self.N):
                 for tau in range(tau_min, tau_max + 1):
-                    if tau == 0 and i == j:
+                    if i == j and tau == 0:
                         continue
-
-                    cond_set = self._get_mci_conditions(
-                        i,
-                        j,
-                        tau,
-                        parents,
-                        max_conds_py,
-                        max_conds_px,
-                    )
-                    n_cond = len(cond_set)
+                        
+                    # Construct conditioning set
+                    cond_set = set(parents_j)
+                    if (i, -tau) in cond_set:
+                        cond_set.remove((i, -tau))
+                        
+                    for p_var, p_lag in parents.get(i, set()):
+                        new_lag = p_lag - tau
+                        if new_lag <= 0:
+                            cond_set.add((p_var, new_lag))
+                            
+                    cond_list = sorted(list(cond_set)) # Sort for stability
                     
-                    # Compute max lag for this test
-                    if cond_set:
-                        max_cond_lag = max(lag for _, lag in cond_set)
-                        effective_max_lag = max(tau, max_cond_lag)
-                    else:
-                        effective_max_lag = tau
+                    # Apply max_conds limits
+                    if max_conds_py is not None or max_conds_px is not None:
+                        # Separate into parents of Y and parents of X
+                        py_conds = [(v, l) for v, l in cond_list if (v, l) in parents_j or (v, l-tau) in parents_j]
+                        px_conds = [(v, l) for v, l in cond_list if (v, l) not in py_conds]
+                        
+                        # Apply limits
+                        if max_conds_py is not None:
+                            py_conds = py_conds[:max_conds_py]
+                        if max_conds_px is not None:
+                            px_conds = px_conds[:max_conds_px]
+                            
+                        cond_list = sorted(py_conds + px_conds)
+                    
+                    test_specs.append({
+                        'i': i, 'j': j, 'tau': tau,
+                        'conds': cond_list
+                    })
 
-                    key = (n_cond, effective_max_lag)
-                    if key not in tests_by_shape:
-                        tests_by_shape[key] = []
-                    tests_by_shape[key].append((i, j, tau, cond_set))
+                    
+        if not test_specs:
+            return jnp.zeros((self.N, self.N, tau_max + 1)), jnp.ones((self.N, self.N, tau_max + 1))
+            
+        # Group by conditioning set size for efficient batching
+        specs_by_dim = {}
+        for spec in test_specs:
+            dim = len(spec['conds'])
+            if dim not in specs_by_dim:
+                specs_by_dim[dim] = []
+            specs_by_dim[dim].append(spec)
+            
+        final_val = jnp.zeros((self.N, self.N, tau_max + 1))
+        # Initialize p-values to 1.0 (not significant)
+        final_pval = jnp.ones((self.N, self.N, tau_max + 1))
+        
+        # Process each group
+        if self.verbosity >= 1:
+            pbar = tqdm(total=len(test_specs), desc="MCI Tests")
+            
+        for dim, specs in specs_by_dim.items():
+            # Create batches
+            batch_size = 4096 # Configurable
+            
+            for k in range(0, len(specs), batch_size):
+                batch = specs[k:k+batch_size]
+                
+                i_s =  [b['i'] for b in batch]
+                j_s =  [b['j'] for b in batch]
+                tau_s = [b['tau'] for b in batch]
+                
+                cond_vars = []
+                cond_lags = []
+                
+                if dim > 0:
+                    for b in batch:
+                        cv = [c[0] for c in b['conds']]
+                        cl = [-c[1] for c in b['conds']]
+                        cond_vars.append(cv)
+                        cond_lags.append(cl)
+                
+                # Get batch data
+                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                    jnp.array(i_s), jnp.array(j_s), jnp.array(tau_s),
+                    jnp.array(cond_vars) if dim > 0 else None,
+                    jnp.array(cond_lags) if dim > 0 else None,
+                    max_lag=tau_max
+                )
+                
+                statistics, pvals = self.test.run_batch(X_b, Y_b, Z_b)
+                
+                # Vectorized scatter back to matrix using advanced indexing
+                # Convert lists to arrays for indexing
+                i_arr = jnp.array(i_s)
+                j_arr = jnp.array(j_s)
+                tau_arr = jnp.array(tau_s)
+                
+                # Use vectorized .at[] operation with tuple indexing
+                final_val = final_val.at[i_arr, j_arr, tau_arr].set(statistics)
+                final_pval = final_pval.at[i_arr, j_arr, tau_arr].set(pvals)
+                    
+                if self.verbosity >= 1:
+                    pbar.update(len(batch))
+                    
+        if self.verbosity >= 1:
+            pbar.close()
+            
+        return final_val, final_pval
 
-        # Process each batch
-        for (n_cond, max_lag), tests in tests_by_shape.items():
-            if self.verbosity >= 2:
-                print(f"Processing {len(tests)} tests with {n_cond} conditions, max_lag={max_lag}")
-
-            if len(tests) == 0:
-                continue
-
-            effective_T = self.T - max_lag
-            batch_size = self._get_effective_batch_size(n_samples=effective_T, n_conditions=n_cond)
-            if batch_size is None:
-                chunk_ranges = [(0, len(tests))]
-            else:
-                chunk_ranges = [
-                    (start, min(start + batch_size, len(tests)))
-                    for start in range(0, len(tests), batch_size)
-                ]
-
-            for start, end in chunk_ranges:
-                i_list = []
-                j_list = []
-                tau_list = []
-                cond_vars_list = [] if n_cond > 0 else None
-                cond_lags_list = [] if n_cond > 0 else None
-
-                for i, j, tau, cond_set in tests[start:end]:
-                    i_list.append(i)
-                    j_list.append(j)
-                    tau_list.append(tau)
-                    if n_cond > 0:
-                        cond_vars_list.append([var for var, _ in cond_set])
-                        cond_lags_list.append([lag for _, lag in cond_set])
-
-                i_arr = jnp.asarray(i_list, dtype=jnp.int32)
-                j_arr = jnp.asarray(j_list, dtype=jnp.int32)
-                tau_arr = jnp.asarray(tau_list, dtype=jnp.int32)
-
-                if n_cond > 0:
-                    cond_vars = jnp.asarray(cond_vars_list, dtype=jnp.int32)
-                    cond_lags = jnp.asarray(cond_lags_list, dtype=jnp.int32)
-                    X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
-                        i_arr,
-                        j_arr,
-                        tau_arr,
-                        cond_vars=cond_vars,
-                        cond_lags=cond_lags,
-                        max_lag=max_lag,
-                    )
-                else:
-                    X_arr, Y_arr, Z_arr = self.datahandler.get_variable_pair_batch(
-                        i_arr,
-                        j_arr,
-                        tau_arr,
-                        max_lag=max_lag,
-                    )
-
-                # Run batch test
-                stats, pvals = self.test.run_batch(X_arr, Y_arr, Z_arr)
-
-                # Store results (vectorized scatter)
-                val_matrix = val_matrix.at[i_arr, j_arr, tau_arr].set(stats)
-                pval_matrix = pval_matrix.at[i_arr, j_arr, tau_arr].set(pvals)
-
-        return val_matrix, pval_matrix
-
-    def get_parents(
-        self, variable: int
-    ) -> Set[Tuple[int, int]]:
-        """
-        Get the identified parents of a variable.
-
-        Parameters
-        ----------
-        variable : int
-            Variable index.
-
-        Returns
-        -------
-        set of (int, int)
-            Set of (variable_index, lag) tuples representing parents.
-
-        Examples
-        --------
-        >>> parents = pcmci.get_parents(0)
-        >>> for var, lag in parents:
-        ...     print(f"X{var}(t{lag}) -> X0(t)")
-        """
-        if variable not in self._parents:
-            return set()
-        return self._parents[variable].copy()
-
-    @property
-    def val_matrix(self) -> Optional[jax.Array]:
-        """Get the test statistic matrix from the last run."""
-        return self._val_matrix
-
-    @property
-    def pval_matrix(self) -> Optional[jax.Array]:
-        """Get the p-value matrix from the last run."""
-        return self._pval_matrix
-
-    def __repr__(self) -> str:
-        return (
-            f"PCMCI(N={self.N}, T={self.T}, test={self.test.name}, "
-            f"verbosity={self.verbosity})"
-        )

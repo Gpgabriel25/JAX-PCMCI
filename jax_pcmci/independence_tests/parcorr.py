@@ -34,7 +34,7 @@ Example
 from __future__ import annotations
 
 from functools import partial
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -293,19 +293,12 @@ class ParCorr(CondIndTest):
         jax.Array
             Partial correlation coefficient in [-1, 1].
         """
-        # Ensure proper dtype - only convert if needed
-        dtype = get_config().dtype
-        if not isinstance(X, jax.Array) or X.dtype != dtype:
-            X = jnp.asarray(X, dtype=dtype)
-        if not isinstance(Y, jax.Array) or Y.dtype != dtype:
-            Y = jnp.asarray(Y, dtype=dtype)
-
+        # Trust callers to pass correct types - already JAX arrays
+        # Type conversions are handled at data loading time
         if Z is None or (hasattr(Z, 'shape') and Z.shape[-1] == 0):
             # Simple correlation (no conditioning)
             return _compute_correlation_jit(X, Y)
         else:
-            if not isinstance(Z, jax.Array) or Z.dtype != dtype:
-                Z = jnp.asarray(Z, dtype=dtype)
             # Partial correlation via residuals
             return _compute_partial_correlation_jit(X, Y, Z)
 
@@ -372,27 +365,23 @@ class ParCorr(CondIndTest):
         """
         T, N = data.shape
         
-        # Vectorized implementation: for each tau, compute all N*N correlations at once
+        # Vectorized implementation using vmap
+        @jax.jit
         def compute_corrs_for_tau(tau):
             effective_T = T - tau
-            # For tau=0, use full data; for tau>0, use lagged data
-            X_data = jax.lax.cond(
-                tau == 0,
-                lambda: data,
-                lambda: data[: T - tau, :]  # X at t - tau
-            )[:effective_T, :]
-            Y_data = jax.lax.cond(
-                tau == 0,
-                lambda: data,
-                lambda: data[tau:, :]  # Y at t
-            )[:effective_T, :]
+            # Simple slicing - no need for lax.cond
+            X_data = data[: T - tau, :] if tau > 0 else data
+            Y_data = data[tau:, :] if tau > 0 else data
+            
+            # Use only the effective range
+            X_data = X_data[:effective_T, :]
+            Y_data = Y_data[:effective_T, :]
             
             # Center data for all variables at once
             X_centered = X_data - jnp.mean(X_data, axis=0, keepdims=True)
             Y_centered = Y_data - jnp.mean(Y_data, axis=0, keepdims=True)
             
-            # Compute all pairwise correlations: corr[i,j] = sum(X_i * Y_j) / sqrt(sum(X_i^2) * sum(Y_j^2))
-            # Using matrix operations: (X^T @ Y) / outer(norm_X, norm_Y)
+            # Compute all pairwise correlations using matrix operations
             norms_X = jnp.sqrt(jnp.sum(X_centered**2, axis=0))
             norms_Y = jnp.sqrt(jnp.sum(Y_centered**2, axis=0))
             
@@ -400,16 +389,18 @@ class ParCorr(CondIndTest):
             norms_X = jnp.where(norms_X > 1e-10, norms_X, 1.0)
             norms_Y = jnp.where(norms_Y > 1e-10, norms_Y, 1.0)
             
-            # Correlation matrix for this tau
-            cov_matrix = X_centered.T @ Y_centered / effective_T
-            corr_tau = cov_matrix / jnp.outer(norms_X, norms_Y) * effective_T
+            # Correlation matrix for this tau: (X^T @ Y) / (norm_X * norm_Y)
+            cov_matrix = X_centered.T @ Y_centered
+            corr_tau = cov_matrix / jnp.outer(norms_X, norms_Y)
             
             return jnp.clip(corr_tau, -1.0, 1.0)
         
-        # Stack results for all taus
-        corr_matrix = jnp.stack([compute_corrs_for_tau(tau) for tau in range(tau_max + 1)], axis=2)
+        # Vectorize over all tau values using vmap
+        corr_matrix = jax.vmap(compute_corrs_for_tau)(jnp.arange(tau_max + 1))
+        
+        # Transpose to get shape (N, N, tau_max+1) instead of (tau_max+1, N, N)
+        return jnp.transpose(corr_matrix, (1, 2, 0))
 
-        return corr_matrix
 
     def compute_statistic_batch(
         self,
@@ -449,18 +440,30 @@ class ParCorr(CondIndTest):
         Y_batch: jax.Array,
         Z_batch: Optional[jax.Array] = None,
         alpha: Optional[float] = None,
+        n_conditions: Optional[Union[int, jax.Array]] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         """
         Optimized batch implementation for ParCorr.
         
         This overrides the base class implementation for maximum performance
         by using module-level JIT'd functions instead of method-based JIT.
+
+        Parameters
+        ----------
+        n_conditions : int or jax.Array, optional
+            Number of conditioning variables. If None, inferred from Z_batch.
+            Provide this when using padded Z matrices to ensure correct DF
+            calculations for p-values.
         """
         n_samples = jnp.asarray(X_batch.shape[1], dtype=jnp.int32)
-        n_conditions = jnp.asarray(
-            0 if Z_batch is None else (Z_batch.shape[2] if Z_batch.ndim == 3 else 1),
-            dtype=jnp.int32,
-        )
+        
+        if n_conditions is None:
+            n_conditions = jnp.asarray(
+                0 if Z_batch is None else (Z_batch.shape[2] if Z_batch.ndim == 3 else 1),
+                dtype=jnp.int32,
+            )
+        else:
+            n_conditions = jnp.asarray(n_conditions, dtype=jnp.int32)
         
         # Compute statistics in a single vectorized call
         if Z_batch is None:
