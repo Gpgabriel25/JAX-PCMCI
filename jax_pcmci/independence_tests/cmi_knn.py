@@ -197,12 +197,15 @@ class CMIKnn(CondIndTest):
         # Joint space XY
         XY = jnp.concatenate([X, Y], axis=1)
 
-        # Find k-th neighbor distance in joint space
-        eps = self._kth_neighbor_distance(XY, k)
+        # Compute distances once for joint space and reuse for counting
+        dist_XY = self._compute_distances(XY)
+        eps = self._kth_neighbor_from_dist(dist_XY, k)
 
-        # Count neighbors within eps in marginal spaces
-        n_X = self._count_neighbors(X, eps)
-        n_Y = self._count_neighbors(Y, eps)
+        # Count neighbors using precomputed marginal distances
+        dist_X = self._compute_distances(X)
+        dist_Y = self._compute_distances(Y)
+        n_X = self._count_neighbors_from_dist(dist_X, eps)
+        n_Y = self._count_neighbors_from_dist(dist_Y, eps)
 
         # KSG estimator
         mi = digamma(k) - jnp.mean(digamma(n_X + 1) + digamma(n_Y + 1)) + digamma(n)
@@ -227,13 +230,18 @@ class CMIKnn(CondIndTest):
         YZ = jnp.concatenate([Y, Z], axis=1)
         XYZ = jnp.concatenate([X, Y, Z], axis=1)
 
-        # Find k-th neighbor distance in joint space XYZ
-        eps = self._kth_neighbor_distance(XYZ, k)
+        # Compute distances for joint space XYZ to find eps
+        dist_XYZ = self._compute_distances(XYZ)
+        eps = self._kth_neighbor_from_dist(dist_XYZ, k)
 
-        # Count neighbors within eps in subspaces
-        n_XZ = self._count_neighbors(XZ, eps)
-        n_YZ = self._count_neighbors(YZ, eps)
-        n_Z = self._count_neighbors(Z, eps)
+        # Compute distances for subspaces once and count neighbors
+        dist_XZ = self._compute_distances(XZ)
+        dist_YZ = self._compute_distances(YZ)
+        dist_Z = self._compute_distances(Z)
+
+        n_XZ = self._count_neighbors_from_dist(dist_XZ, eps)
+        n_YZ = self._count_neighbors_from_dist(dist_YZ, eps)
+        n_Z = self._count_neighbors_from_dist(dist_Z, eps)
 
         # Frenzel-Pompe CMI estimator
         cmi = (
@@ -243,47 +251,49 @@ class CMIKnn(CondIndTest):
 
         return jnp.maximum(cmi, 0.0)
 
+    def _compute_distances(self, data: jax.Array) -> jax.Array:
+        """
+        Compute pairwise distances for a dataset.
+        """
+        if self.metric == "chebyshev":
+            return self._chebyshev_distances(data, data)
+        else:
+            return self._euclidean_distances(data, data)
+
+    def _kth_neighbor_from_dist(self, distances: jax.Array, k: int) -> jax.Array:
+        """
+        Find the k-th nearest neighbor distance from precomputed distance matrix.
+        """
+        n = distances.shape[0]
+        # Set self-distance to infinity
+        distances_masked = distances + jnp.eye(n) * jnp.inf
+        # Get k-th neighbor without a full sort (much faster than sort)
+        kth_distances = jnp.partition(distances_masked, k - 1, axis=1)[:, k - 1]
+        return kth_distances
+
+    def _count_neighbors_from_dist(self, distances: jax.Array, eps: jax.Array) -> jax.Array:
+        """
+        Count neighbors within eps distance from precomputed distance matrix.
+        """
+        # Count points strictly within eps (excluding self where distance == 0)
+        within_eps = (distances < eps.reshape(-1, 1)) & (distances > 0)
+        return jnp.sum(within_eps, axis=1)
+
     def _kth_neighbor_distance(self, data: jax.Array, k: int) -> jax.Array:
         """
         Find the distance to the k-th nearest neighbor for each point.
+        (Legacy method - kept for compatibility)
         """
-        n = data.shape[0]
-
-        # Compute pairwise distances
-        if self.metric == "chebyshev":
-            # Maximum norm: max|x_i - y_i|
-            distances = self._chebyshev_distances(data, data)
-        else:
-            # Euclidean norm
-            distances = self._euclidean_distances(data, data)
-
-        # Set self-distance to infinity
-        distances = distances + jnp.eye(n) * jnp.inf
-
-        # Get k-th neighbor without a full sort (much faster than sort)
-        # (0-indexed, so k-1)
-        kth_distances = jnp.partition(distances, k - 1, axis=1)[:, k - 1]
-
-        return kth_distances
+        distances = self._compute_distances(data)
+        return self._kth_neighbor_from_dist(distances, k)
 
     def _count_neighbors(self, data: jax.Array, eps: jax.Array) -> jax.Array:
         """
         Count number of points within distance eps for each point.
+        (Legacy method - kept for compatibility)
         """
-        n = data.shape[0]
-
-        # Compute pairwise distances
-        if self.metric == "chebyshev":
-            distances = self._chebyshev_distances(data, data)
-        else:
-            distances = self._euclidean_distances(data, data)
-
-        # Count points strictly within eps (excluding self)
-        # Using < instead of <= as in standard KSG
-        within_eps = (distances < eps.reshape(-1, 1)) & (distances > 0)
-        counts = jnp.sum(within_eps, axis=1)
-
-        return counts
+        distances = self._compute_distances(data)
+        return self._count_neighbors_from_dist(distances, eps)
 
     @staticmethod
     @jax.jit
@@ -551,10 +561,11 @@ class CMISymbolic(CondIndTest):
         if Z.ndim == 1:
             Z_enc = Z
         else:
-            # Simple encoding: treat as base-n_symbols number
-            Z_enc = jnp.zeros(n, dtype=jnp.int32)
-            for i in range(Z.shape[1]):
-                Z_enc = Z_enc * self.n_symbols + Z[:, i].astype(jnp.int32)
+            # Simple encoding: treat as base-n_symbols number using vectorized reduction
+            # Z_enc = Z[:, 0] * n_symbols^(d-1) + Z[:, 1] * n_symbols^(d-2) + ... + Z[:, d-1]
+            d = Z.shape[1]
+            powers = jnp.power(self.n_symbols, jnp.arange(d - 1, -1, -1))
+            Z_enc = jnp.sum(Z.astype(jnp.int32) * powers, axis=1)
 
         # Compute conditional entropies
         H_X_given_Z = self._conditional_entropy(X, Z_enc)

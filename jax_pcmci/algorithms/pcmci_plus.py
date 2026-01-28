@@ -333,40 +333,82 @@ class PCMCIPlus(PCMCI):
             skeleton_snapshot = {j: skeleton[j].copy() for j in self.selected_variables}
             any_removed = False
 
-            for j in self.selected_variables:
-                current_adj = list(skeleton_snapshot[j])
+            # For cond_dim=0, use batched testing if available
+            if cond_dim == 0 and hasattr(self.test, 'run_batch'):
+                # Batch test all edges at once grouped by lag
+                for j in self.selected_variables:
+                    current_adj = list(skeleton_snapshot[j])
+                    if not current_adj:
+                        continue
+                    
+                    # Group by lag for proper batching
+                    edges_by_lag: Dict[int, List[Tuple[int, int]]] = {}
+                    for adj in current_adj:
+                        i, neg_tau = adj
+                        tau = -neg_tau
+                        if tau not in edges_by_lag:
+                            edges_by_lag[tau] = []
+                        edges_by_lag[tau].append(adj)
+                    
+                    edges_to_remove = []
+                    
+                    for tau, edges_at_tau in edges_by_lag.items():
+                        i_list = [adj[0] for adj in edges_at_tau]
+                        i_arr = jnp.asarray(i_list, dtype=jnp.int32)
+                        j_arr = jnp.full((len(edges_at_tau),), j, dtype=jnp.int32)
+                        tau_arr = jnp.full((len(edges_at_tau),), tau, dtype=jnp.int32)
+                        
+                        X_batch, Y_batch, _ = self.datahandler.get_variable_pair_batch(
+                            i_arr, j_arr, tau_arr, max_lag=tau
+                        )
+                        
+                        stats, pvals = self.test.run_batch(X_batch, Y_batch, None, alpha=pc_alpha)
+                        
+                        for idx, pval in enumerate(pvals):
+                            if float(pval) > pc_alpha:  # Independent
+                                edges_to_remove.append(edges_at_tau[idx])
+                                sepsets[(edges_at_tau[idx][0], j, tau)] = set()
+                                sepsets[(j, edges_at_tau[idx][0], -tau)] = set()
+                                any_removed = True
+                    
+                    for edge in edges_to_remove:
+                        skeleton[j].discard(edge)
+            else:
+                # Original sequential code path
+                for j in self.selected_variables:
+                    current_adj = list(skeleton_snapshot[j])
 
-                if len(current_adj) <= cond_dim:
-                    continue
+                    if len(current_adj) <= cond_dim:
+                        continue
 
-                edges_to_remove = []
+                    edges_to_remove = []
 
-                for adj in current_adj:
-                    i, neg_tau = adj
-                    tau = -neg_tau
+                    for adj in current_adj:
+                        i, neg_tau = adj
+                        tau = -neg_tau
 
-                    # Get other adjacent nodes as potential conditioning set
-                    other_adj = [a for a in current_adj if a != adj]
+                        # Get other adjacent nodes as potential conditioning set
+                        other_adj = [a for a in current_adj if a != adj]
 
-                    # Test with subsets of size cond_dim
-                    independent, sep_set = self._test_independence_with_subsets(
-                        i=i,
-                        j=j,
-                        tau=tau,
-                        other_adj=other_adj,
-                        cond_dim=cond_dim,
-                        pc_alpha=pc_alpha,
-                    )
+                        # Test with subsets of size cond_dim
+                        independent, sep_set = self._test_independence_with_subsets(
+                            i=i,
+                            j=j,
+                            tau=tau,
+                            other_adj=other_adj,
+                            cond_dim=cond_dim,
+                            pc_alpha=pc_alpha,
+                        )
 
-                    if independent:
-                        edges_to_remove.append(adj)
-                        # Store separating set
-                        sepsets[(i, j, tau)] = sep_set
-                        sepsets[(j, i, -tau)] = sep_set  # Symmetric
-                        any_removed = True
+                        if independent:
+                            edges_to_remove.append(adj)
+                            # Store separating set
+                            sepsets[(i, j, tau)] = sep_set
+                            sepsets[(j, i, -tau)] = sep_set  # Symmetric
+                            any_removed = True
 
-                for edge in edges_to_remove:
-                    skeleton[j].discard(edge)
+                    for edge in edges_to_remove:
+                        skeleton[j].discard(edge)
 
             if not any_removed:
                 break

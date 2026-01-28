@@ -221,15 +221,21 @@ class PCMCIResults:
         sorted_idx = np.argsort(pvals_flat)
         sorted_pvals = pvals_flat[sorted_idx]
 
-        # Compute adjusted p-values
-        adjusted = np.zeros(n)
-        cummin = 1.0
-
-        for i in range(n - 1, -1, -1):
-            rank = i + 1
-            adjusted_p = sorted_pvals[i] * n / rank
-            cummin = min(cummin, adjusted_p)
-            adjusted[sorted_idx[i]] = min(cummin, 1.0)
+        # Compute adjusted p-values (vectorized)
+        # adjusted_p[i] = p[i] * n / (i+1)
+        ranks = np.arange(1, n + 1)
+        raw_adjusted = sorted_pvals * n / ranks
+        
+        # Apply cumulative minimum from the end (reverse cummin)
+        # np.minimum.accumulate on reversed array
+        cummin_adjusted = np.minimum.accumulate(raw_adjusted[::-1])[::-1]
+        
+        # Cap at 1.0
+        cummin_adjusted = np.minimum(cummin_adjusted, 1.0)
+        
+        # Put back in original order
+        adjusted = np.empty(n)
+        adjusted[sorted_idx] = cummin_adjusted
 
         return adjusted.reshape(shape)
 
