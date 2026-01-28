@@ -17,10 +17,12 @@ JAX-PCMCI is a library for causal discovery from time series data, implementing 
 - **GPU/TPU Acceleration**: Leverages JAX for massive parallelization
 - **PCMCI & PCMCI+**: Both lagged and contemporaneous causal discovery
 - **Multiple Independence Tests**:
-  - `ParCorr`: Partial correlation for linear dependencies
-  - `CMIKnn`: k-NN conditional mutual information for nonlinear dependencies
-  - `GPDCond`: Gaussian Process distance correlation for complex nonlinear relationships
+    - `ParCorr`: Partial correlation for linear dependencies
+    - `CMIKnn`: k-NN conditional mutual information for nonlinear dependencies
+    - `CMISymbolic`: fast symbolic CMI via discretization
+    - `GPDCond`: Gaussian Process distance correlation for complex nonlinear relationships
 - **Parallel Test Execution**: Vectorized batch testing with `vmap`/`pmap`
+- **Memory-Aware Batching**: Automatic batch sizing when `batch_size` is not set
 - **FDR Correction**: Built-in Benjamini-Hochberg and Bonferroni corrections
 - **Publication-Ready Visualization**: Graph and time series plots
 
@@ -135,6 +137,19 @@ test = CMIKnn(
 )
 ```
 
+### CMISymbolic (Symbolic Conditional Mutual Information)
+
+Fast discretized alternative to CMI-kNN.
+
+```python
+from jax_pcmci import CMISymbolic
+
+test = CMISymbolic(
+    n_symbols=6,              # Number of bins
+    significance='analytic'
+)
+```
+
 ### GPDCond (Gaussian Process Distance Correlation)
 
 Advanced nonlinear test using GP regression residuals.
@@ -174,9 +189,10 @@ set_device('auto')  # Auto-select best
 from jax_pcmci import PCMCIConfig
 
 config = PCMCIConfig(
-    precision='float64',       # 'float32' for speed, 'float64' for accuracy
+    precision='float32',       # default; use 'float64' for higher accuracy
     parallelization='auto',    # 'vmap', 'pmap', or 'sequential'
     random_seed=42,            # For reproducibility
+    enable_x64=False,          # enable 64-bit if using float64
     progress_bar=True,
     verbosity=1                # 0=silent, 1=normal, 2=verbose
 )
@@ -262,6 +278,17 @@ pcmci = PCMCI(datahandler, cond_ind_test=MyCustomTest())
 results = pcmci.run_batch_mci(tau_max=5)
 ```
 
+### End-to-End Speed Benchmark
+
+```bash
+python examples/benchmark_pcmci_speed.py
+```
+
+Environment knobs (optional):
+- `PCMCI_SPEED_T`, `PCMCI_SPEED_N`, `PCMCI_SPEED_TAU_MAX`
+- `PCMCI_SPEED_PC_ALPHA`, `PCMCI_SPEED_ALPHA_LEVEL`, `PCMCI_SPEED_MAX_CONDS_DIM`
+- `PCMCI_SPEED_DEVICE`, `PCMCI_SPEED_WARMUP`
+
 ### Memory-Efficient Mode
 
 ```python
@@ -270,6 +297,17 @@ config = PCMCIConfig(
     batch_size=100          # Process tests in batches
 )
 config.apply()
+
+### GPU Memory Controls
+
+```python
+config = PCMCIConfig(
+    gpu_preallocate=False,   # Avoids full preallocation
+    gpu_memory_fraction=0.7, # Allocate 70% of GPU memory
+    gpu_allocator='bfc',     # or 'platform'
+)
+config.apply()
+```
 ```
 
 ## Algorithm Details
@@ -299,7 +337,7 @@ PCMCI+ extends PCMCI to handle contemporaneous (τ=0) causal links:
 | GPU/TPU Support |  Native |  CPU only |
 | Parallelization |  vmap/pmap |  Limited |
 | JIT Compilation |  Full |  No |
-| Independence Tests | ParCorr, CMI, GPDC | Many |
+| Independence Tests | ParCorr, CMIKnn, CMISymbolic, GPDC | Many |
 | Speed (GPU) | 10-100x faster | Baseline |
 
 ## 📖 References
