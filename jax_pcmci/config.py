@@ -97,7 +97,7 @@ class PCMCIConfig:
 
     Parameters
     ----------
-    precision : Precision or str, default='float64'
+    precision : Precision or str, default='float32'
         Numerical precision for computations. Options:
         - 'float32': Faster, less memory, slightly less accurate
         - 'float64': Slower, more memory, more accurate (recommended)
@@ -111,7 +111,7 @@ class PCMCIConfig:
         Random seed for reproducibility. If None, uses system entropy.
     jit_compile : bool, default=True
         Whether to JIT compile core functions. Disable for debugging.
-    enable_x64 : bool, default=True
+    enable_x64 : bool, default=False
         Enable 64-bit floating point support in JAX.
     memory_efficient : bool, default=False
         Enable memory-efficient mode for large datasets.
@@ -423,7 +423,7 @@ def set_device(
         raise ValueError(f"Unknown device: {device}. Use 'cpu', 'gpu', 'tpu', or 'auto'")
 
 
-def get_device_info() -> dict[str, Any]:
+def get_device_info() -> Dict[str, Any]:
     """
     Get information about available JAX devices.
 

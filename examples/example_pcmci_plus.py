@@ -10,6 +10,8 @@ This is essential for systems where causation happens within
 the sampling interval.
 """
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import numpy as np

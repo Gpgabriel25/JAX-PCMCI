@@ -188,14 +188,17 @@ class PCMCI:
         if total <= max_subsets:
             return list(combinations(items, k))
 
-        rng = random.Random(seed)
+        # Use JAX RNG for consistency and better performance
+        key = jax.random.PRNGKey(seed)
         reservoir: List[Tuple[Tuple[int, int], ...]] = []
 
         for idx, combo in enumerate(combinations(items, k)):
             if idx < max_subsets:
                 reservoir.append(combo)
             else:
-                j = rng.randint(0, idx)
+                # Use JAX random for consistency
+                key, subkey = jax.random.split(key)
+                j = int(jax.random.randint(subkey, (), 0, idx + 1))
                 if j < max_subsets:
                     reservoir[j] = combo
 
@@ -238,7 +241,7 @@ class PCMCI:
                     available = (total_mem - in_use) * 0.7  # Use 70% of available
                     
                     # Estimate bytes per test: (X + Y + Z) * dtype_size * 3 (intermediates)
-                    dtype_size = 4 if config.precision.value == 'float32' else 8
+                    dtype_size = jnp.dtype(config.dtype).itemsize
                     bytes_per_test = n_samples * (2 + n_conditions) * dtype_size * 3
                     
                     if bytes_per_test > 0:
@@ -344,8 +347,8 @@ class PCMCI:
         self.datahandler.precompute_lagged_data(tau_max)
 
         # Initialize result matrices
-        self._val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
-        self._pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
+        self._val_matrix = jnp.zeros((self.N, self.N, tau_max + 1), dtype=get_config().dtype)
+        self._pval_matrix = jnp.ones((self.N, self.N, tau_max + 1), dtype=get_config().dtype)
 
         # Phase 1: PC condition selection
         if self.verbosity >= 1:
@@ -708,9 +711,6 @@ class PCMCI:
             Maximum number of conditioning subsets to test. For large parent
             sets, randomly samples subsets instead of testing all C(n,k).
         """
-        from itertools import combinations
-        import random
-
         if cond_dim == 0:
             # Unconditional test
             X, Y, Z = self.datahandler.get_variable_pair_data(i, j, tau, None)
@@ -850,8 +850,9 @@ class PCMCI:
         if parents is None:
             parents = self._parents
 
-        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
-        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
+        dtype = get_config().dtype
+        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1), dtype=dtype)
+        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1), dtype=dtype)
 
         # Collect all tests to run
         tests_to_run = []
@@ -990,8 +991,9 @@ class PCMCI:
         if parents is None:
             parents = self._parents
 
-        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
-        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
+        dtype = get_config().dtype
+        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1), dtype=dtype)
+        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1), dtype=dtype)
 
         # Group tests by (n_conditions, max_lag) for proper batching
         # Same n_cond AND same max_lag = same data shapes = can batch

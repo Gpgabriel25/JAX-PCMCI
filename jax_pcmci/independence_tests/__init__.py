@@ -16,12 +16,13 @@ All tests follow a common interface defined by the CondIndTest base class.
 
 from jax_pcmci.independence_tests.base import CondIndTest
 from jax_pcmci.independence_tests.parcorr import ParCorr
-from jax_pcmci.independence_tests.cmi_knn import CMIKnn
+from jax_pcmci.independence_tests.cmi_knn import CMIKnn, CMISymbolic
 from jax_pcmci.independence_tests.gpdc import GPDCond
 
 __all__ = [
     "CondIndTest",
     "ParCorr",
     "CMIKnn",
+    "CMISymbolic",
     "GPDCond",
 ]

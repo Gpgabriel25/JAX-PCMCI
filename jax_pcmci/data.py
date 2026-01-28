@@ -29,7 +29,7 @@ Example
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from collections import OrderedDict
 from functools import partial
 
@@ -87,10 +87,10 @@ class TimeSeriesData:
     """
 
     values: jax.Array
-    var_names: Optional[list[str]] = None
+    var_names: Optional[List[str]] = None
     time_index: Optional[jax.Array] = None
     mask: Optional[jax.Array] = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate and initialize data attributes."""
@@ -268,7 +268,7 @@ class DataHandler:
         data: Union[np.ndarray, jax.Array, TimeSeriesData],
         normalize: Union[bool, str] = True,
         missing_flag: Optional[float] = None,
-        var_names: Optional[list[str]] = None,
+        var_names: Optional[List[str]] = None,
         dtype: Optional[jnp.dtype] = None,
     ):
         self._dtype = dtype or get_config().dtype
@@ -331,7 +331,7 @@ class DataHandler:
         return self._data.N
 
     @property
-    def var_names(self) -> list[str]:
+    def var_names(self) -> List[str]:
         """Variable names."""
         return self._data.var_names
 
@@ -353,6 +353,10 @@ class DataHandler:
 
         # Update mask
         self._data.mask = ~missing_mask
+
+        # Replace missing values with NaN to ensure downstream reductions ignore them
+        # (normalization and statistics use nan-aware reductions).
+        self._data.values = jnp.where(self._data.mask, self._data.values, jnp.nan)
 
         # Count missing values
         n_missing = jnp.sum(missing_mask)
@@ -453,25 +457,19 @@ class DataHandler:
         # Current values (t = tau_max, tau_max+1, ..., T-1)
         X_current = self.values[tau_max:]
 
-        # Build lagged array using lax.scan to reduce Python overhead
+        # Build lagged array efficiently using slicing
         if include_contemporaneous:
-            lags = jnp.arange(0, tau_max + 1)
+            n_lags = tau_max + 1
+            start_lag = 0
         else:
-            lags = jnp.arange(1, tau_max + 1)
+            n_lags = tau_max
+            start_lag = 1
 
-        n_lags = int(lags.shape[0])
-        X_lagged_init = jnp.zeros((effective_T, N, n_lags), dtype=self.values.dtype)
-
-        def body(carry, lag_idx):
-            lag = lags[lag_idx]
-            start_t = tau_max - lag
-            slice_t = lax.dynamic_slice(
-                self.values, (start_t, 0), (effective_T, N)
-            )
-            carry = carry.at[:, :, lag_idx].set(slice_t)
-            return carry, None
-
-        X_lagged, _ = lax.scan(body, X_lagged_init, jnp.arange(n_lags))
+        # Use list comprehension then stack (faster than loop with .at[].set())
+        X_lagged = jnp.stack([
+            self.values[tau_max - lag : T - lag, :]
+            for lag in range(start_lag, start_lag + n_lags)
+        ], axis=2)
 
         # Store in cache
         self._lagged_cache[cache_key] = (X_current, X_lagged)
@@ -564,12 +562,10 @@ class DataHandler:
             )
 
         # Source variable at t - tau
-        if tau == 0:
-            X = self.values[max_lag:, i]
-        else:
-            X = self.values[max_lag - tau : self.T - tau, i]
-
-        # Target variable at t
+        # Both X and Y need to be aligned to the same time window
+        # X at time (t-tau) where t ranges from max_lag to T-1
+        # Y at time t where t ranges from max_lag to T-1
+        X = self.values[max_lag - tau : self.T - tau, i]
         Y = self.values[max_lag:, j]
 
         # Conditioning set
@@ -601,12 +597,14 @@ class DataHandler:
         var_idxs: jax.Array,
         length: int,
     ) -> jax.Array:
-        """Vectorized 1D slice extraction using dynamic slicing."""
-
-        def slice_one(start_idx, var_idx):
-            return lax.dynamic_slice(values, (start_idx, var_idx), (length, 1)).squeeze(1)
-
-        return jax.vmap(slice_one)(start_idxs, var_idxs)
+        """Vectorized 1D slice extraction using advanced indexing."""
+        # Use advanced indexing which is more efficient than vmap of dynamic_slice
+        # Create index arrays for all positions
+        time_offsets = jnp.arange(length)  # [0, 1, 2, ..., length-1]
+        time_indices = start_idxs[:, None] + time_offsets[None, :]  # (batch, length)
+        
+        # Gather values using advanced indexing
+        return values[time_indices, var_idxs[:, None]]
 
     def get_variable_pair_batch(
         self,

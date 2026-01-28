@@ -6,6 +6,8 @@ This example benchmarks JAX-PCMCI performance across different
 configurations to help you choose optimal settings for your hardware.
 """
 
+from __future__ import annotations
+
 import os
 import signal
 import time

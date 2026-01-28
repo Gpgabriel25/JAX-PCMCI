@@ -48,6 +48,7 @@ from jax_pcmci.independence_tests import (
     CondIndTest,
     ParCorr,
     CMIKnn,
+    CMISymbolic,
     GPDCond,
 )
 from jax_pcmci.algorithms import PCMCI, PCMCIPlus
@@ -70,6 +71,7 @@ __all__ = [
     "CondIndTest",
     "ParCorr",
     "CMIKnn",
+    "CMISymbolic",
     "GPDCond",
     # Algorithms
     "PCMCI",

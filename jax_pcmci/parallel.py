@@ -28,7 +28,7 @@ Example:
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Optional, Sequence, Tuple, Union
 from dataclasses import dataclass
 from functools import partial
 
@@ -120,7 +120,7 @@ def get_optimal_chunk_size(
     compilation and intermediate computations.
     """
     # Bytes per element
-    bytes_per_elem = 8 if dtype == jnp.float64 else 4
+    bytes_per_elem = jnp.dtype(dtype).itemsize
     
     # Memory available (use 70% to leave headroom)
     available_bytes = memory_limit_gb * 1e9 * 0.7
@@ -319,6 +319,15 @@ def parallel_map(
     """
     if config is None:
         config = ParallelConfig()
+
+    if config.n_devices is not None:
+        if config.n_devices < 1:
+            raise ValueError(f"n_devices must be >= 1, got {config.n_devices}")
+        available = jax.device_count()
+        if config.n_devices > available:
+            raise ValueError(
+                f"n_devices ({config.n_devices}) exceeds available devices ({available})"
+            )
     
     batch_size = data.shape[0]
     n_devices = jax.device_count()
@@ -579,7 +588,7 @@ def benchmark_parallel_modes(
     n_samples: int = 500,
     n_tests: int = 1000,
     seed: int = 42
-) -> dict[str, BenchmarkResult]:
+) -> Dict[str, BenchmarkResult]:
     """
     Benchmark different parallelization modes.
     

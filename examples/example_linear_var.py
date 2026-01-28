@@ -9,6 +9,8 @@ The ground truth causal structure is known, allowing us to verify
 the accuracy of the discovered links.
 """
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import numpy as np

@@ -9,6 +9,8 @@ in data with nonlinear dependencies.
 Linear tests like ParCorr would fail to detect these relationships.
 """
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import numpy as np

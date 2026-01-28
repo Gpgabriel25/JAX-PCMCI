@@ -12,6 +12,8 @@ This is a stress test for:
 - GPU utilization with large matrices
 """
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import numpy as np

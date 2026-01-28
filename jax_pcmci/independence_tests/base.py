@@ -83,6 +83,9 @@ class TestResult:
     test_name: str
     extra_info: dict = field(default_factory=dict)
 
+    # Prevent pytest from treating this as a test class
+    __test__ = False
+
     def __repr__(self) -> str:
         sig_str = "***" if self.significant else ""
         return (
@@ -362,8 +365,6 @@ class CondIndTest(ABC):
         if Z_batch is None:
             return self._run_batch_no_z(X_batch, Y_batch)
         return self._run_batch_with_z(X_batch, Y_batch, Z_batch)
-
-        return stats, pvals
 
     # ----- JITed batch helpers -------------------------------------------------
 

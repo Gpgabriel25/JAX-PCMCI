@@ -220,7 +220,7 @@ class ParCorr(CondIndTest):
         """
         Compute OLS residuals: target - Z @ (Z^T Z)^{-1} Z^T target
 
-        Optimized using Cholesky solve on centered data for speed and memory efficiency.
+        Uses QR decomposition for better numerical stability and performance.
         """
         # Ensure 2D
         if predictors.ndim == 1:
@@ -230,22 +230,17 @@ class ParCorr(CondIndTest):
         target_c = target - jnp.mean(target)
         predictors_c = predictors - jnp.mean(predictors, axis=0)
 
-        # Solve normal equations: (Z^T Z) beta = Z^T y
-        # Using regularization for numerical stability (similar to rcond in lstsq)
-        gram = predictors_c.T @ predictors_c
+        # Use QR decomposition: much more stable and faster than solving normal equations
+        # Q @ R = predictors_c
+        # beta = R^-1 @ Q^T @ target_c
+        Q, R = jnp.linalg.qr(predictors_c)
         
-        # Regularization proportional to trace or fixed small value
-        # 1e-6 is usually sufficient for stability
-        ridge = 1e-6 * jnp.eye(gram.shape[0], dtype=gram.dtype)
-        
-        # Compute coefficients: beta = (Z'Z + lambda*I)^-1 Z'y
-        # sym_pos=True uses Cholesky which is faster than general solve or lstsq
-        rhs = predictors_c.T @ target_c
-        coeffs = linalg.solve(gram + ridge, rhs, assume_a='pos')
+        # Compute coefficients: beta = R^-1 @ (Q^T @ target_c)
+        Qty = Q.T @ target_c
+        coeffs = linalg.solve_triangular(R, Qty, lower=False)
 
-        # Compute residuals
-        predicted = predictors_c @ coeffs
-        residual = target_c - predicted
+        # Compute residuals more efficiently: residual = target_c - Q @ Q^T @ target_c
+        residual = target_c - Q @ Qty
 
         return residual
 
@@ -334,20 +329,32 @@ class ParCorr(CondIndTest):
         T, N = data.shape
         corr_matrix = jnp.zeros((N, N, tau_max + 1))
 
+        # Vectorize over lags for better performance
         for tau in range(tau_max + 1):
             effective_T = T - tau
-            for i in range(N):
-                for j in range(N):
-                    if tau == 0:
-                        X = data[:, i]
-                        Y = data[:, j]
-                    else:
-                        X = data[: T - tau, i]  # X at t - tau
-                        Y = data[tau:, j]  # Y at t
-
-                    corr_matrix = corr_matrix.at[i, j, tau].set(
-                        self._compute_correlation(X, Y)
-                    )
+            if tau == 0:
+                # Contemporaneous correlations - can vectorize fully
+                data_centered = data[:effective_T] - jnp.mean(data[:effective_T], axis=0)
+                cov = data_centered.T @ data_centered / effective_T
+                std = jnp.std(data[:effective_T], axis=0)
+                std_prod = std[:, None] * std[None, :]
+                corr = jnp.where(std_prod > 1e-10, cov / std_prod, 0.0)
+                corr_matrix = corr_matrix.at[:, :, tau].set(corr)
+            else:
+                # Lagged correlations - vectorize over variable pairs
+                X_lagged = data[: T - tau, :]  # X at t - tau
+                Y_current = data[tau:, :]  # Y at t
+                
+                # Vectorized correlation computation
+                X_centered = X_lagged - jnp.mean(X_lagged, axis=0)
+                Y_centered = Y_current - jnp.mean(Y_current, axis=0)
+                
+                cov = X_centered.T @ Y_centered / effective_T
+                std_x = jnp.std(X_lagged, axis=0)
+                std_y = jnp.std(Y_current, axis=0)
+                std_prod = std_x[:, None] * std_y[None, :]
+                corr = jnp.where(std_prod > 1e-10, cov / std_prod, 0.0)
+                corr_matrix = corr_matrix.at[:, :, tau].set(corr)
 
         return corr_matrix
 
