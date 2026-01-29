@@ -47,7 +47,14 @@ def main():
         
         print(f"Parents Match: {parents_match}")
         print(f"P-values Match: {pvals_close}")
+        if not pvals_close:
+            max_diff = np.nanmax(np.abs(baseline["pvals"] - current_results["pvals"]))
+            print(f"  Max P-val Diff: {max_diff}")
+            
         print(f"Values Match: {vals_close}")
+        if not vals_close:
+            max_diff = np.nanmax(np.abs(baseline["vals"] - current_results["vals"]))
+            print(f"  Max Val Diff: {max_diff}")
         
         if not (parents_match and pvals_close and vals_close):
              print("FAILURE: mismatch detected!")

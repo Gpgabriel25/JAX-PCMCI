@@ -447,6 +447,89 @@ class PCMCI:
         """
         return jnp.empty((0, )), jnp.empty((0, )), jnp.empty((0, )), jnp.empty((0, ))
 
+    @partial(jax.jit, static_argnums=(0, 8, 9, 10, 11))
+    def _run_pc_loop(
+        self,
+        parents_mask: jax.Array,
+        sepsets_mask: jax.Array,
+        data_values: jax.Array,
+        i_batched: jax.Array,
+        j_batched: jax.Array,
+        tau_batched: jax.Array,
+        key: jax.Array,
+        max_subsets: int,
+        pc_alpha: float,
+        tau_max: int,
+        max_cond_dim_limit: int,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """
+        Execute the PC algorithm loop using jax.lax.while_loop for end-to-end JIT.
+        Returns (final_parents_mask, final_sepsets_mask).
+        """
+        
+        # State: (parents_mask, sepsets_mask, cond_dim, key)
+        # Note: sepsets_mask is dense (N, N, tau_max+1, N, tau_max+1)
+        init_state = (parents_mask, sepsets_mask, 0, key)
+
+        def cond_fun(state):
+            mask, _, cond_dim, _ = state
+            
+            # Stop if cond_dim exceeds limit
+            is_within_limit = cond_dim <= max_cond_dim_limit
+            
+            # Convergence check: stop if max_degree < cond_dim
+            degrees = jnp.sum(mask, axis=(0, 2))
+            max_degree = jnp.max(degrees)
+            has_enough_neighbors = jnp.logical_or(cond_dim == 0, max_degree >= cond_dim)
+            
+            return jnp.logical_and(is_within_limit, has_enough_neighbors)
+
+        def body_fun(state):
+            mask, sepsets, cond_dim, k = state
+            
+            # Split key for this iteration
+            step_key, next_key = jax.random.split(k)
+            
+            # Run the batch kernel
+            pvals_batched, cond_masks_batched = self._run_pc_scanned(
+                data_values, mask, cond_dim,
+                i_batched, j_batched, tau_batched, step_key,
+                max_subsets, pc_alpha, tau_max, max_cond_dim_limit
+            )
+            
+            # Reshape results
+            full_pvals = pvals_batched.reshape(-1) # Padded
+            # reshape cond_masks: (n_batches, batch_size, N, tau_max+1) -> (n_padded, N, tau_max+1)
+            full_cond_masks = cond_masks_batched.reshape(-1, self.N, tau_max + 1)
+            
+            full_i = i_batched.reshape(-1)
+            full_j = j_batched.reshape(-1)
+            full_tau = tau_batched.reshape(-1)
+            
+            should_remove = full_pvals > pc_alpha
+            
+            # Update Parents Mask (REMOVE edges)
+            # mask[i, j, tau] &= !should_remove
+            mask = mask.at[full_i, full_j, full_tau].min(jnp.logical_not(should_remove))
+            
+            # Update Sepsets Mask (ADD sepsets for removed edges)
+            # For removed edges, we store the full_cond_masks.
+            # Use max(logical_or) to accumulate.
+            # Only where should_remove is True.
+            
+            # Broadcast should_remove for masking: (n_padded,) -> (n_padded, 1, 1)
+            update_mask = should_remove[:, None, None]
+            masked_conds = full_cond_masks & update_mask
+            
+            # sepsets[i, j, tau] = masked_conds
+            # Note: since edge is removed, it won't be tested again, so we won't overwrite with a larger set.
+            sepsets = sepsets.at[full_i, full_j, full_tau].max(masked_conds)
+            
+            return (mask, sepsets, cond_dim + 1, next_key)
+
+        final_mask, final_sepsets, _, _ = jax.lax.while_loop(cond_fun, body_fun, init_state)
+        return final_mask, final_sepsets
+
     def run_pc_stable(
         self,
         tau_max: int = 1,
@@ -471,9 +554,6 @@ class PCMCI:
 
         max_dim = max_conds_dim if max_conds_dim is not None else self.N * tau_max
         max_cond_dim_limit = max_dim
-        iterator = range(max_dim + 1)
-        if self.verbosity >= 1:
-            iterator = tqdm(iterator, desc="PC iterations", leave=False)
 
         # Extract data values for JIT
         data_values = self.datahandler.values
@@ -481,22 +561,47 @@ class PCMCI:
         # Check T_eff
         T_full = data_values.shape[0]
         if T_full <= tau_max:
-             raise ValueError("Data length must be greater than tau_max")
-
-        key = jax.random.PRNGKey(42)
+             return self._mask_to_dict(parents_mask)
+             
+        # Prepare indices for all possible links
+        # We test all i -> j at lag tau
+        # parents_mask is already initialized with valid candidates
         
-        # Pre-compute grid indices
-        # Pre-compute grid indices
-        i_idx, j_idx, tau_idx = jnp.meshgrid(
-            jnp.arange(self.N), jnp.arange(self.N), jnp.arange(tau_max + 1), indexing='ij'
+        # Find indices where mask is True initially
+        # Actually it's better to just generate ALL indices and let mask handle validity inside JIT
+        # But to save memory/compute, we can generate all valid pairs (excluding self-lag-0)
+        
+        # Grid of (i, j, tau)
+        i_grid, j_grid, tau_grid = jnp.meshgrid(
+            jnp.arange(self.N), 
+            jnp.arange(self.N), 
+            jnp.arange(tau_max + 1), 
+            indexing='ij'
         )
-        i_flat = i_idx.reshape(-1)
-        j_flat = j_idx.reshape(-1)
-        tau_flat = tau_idx.reshape(-1)
+        
+        # Apply tau_min and self-loop filter to initial indices list
+        valid_mask = jnp.ones_like(i_grid, dtype=bool)
+        if tau_min > 0:
+            valid_mask &= (tau_grid >= tau_min)
+        
+        # Filter self-loops at tau=0 (already handled by tau_min>=1 usually, but for general case)
+        valid_mask &= ~((i_grid == j_grid) & (tau_grid == 0))
+        
+        i_flat = i_grid[valid_mask]
+        j_flat = j_grid[valid_mask]
+        tau_flat = tau_grid[valid_mask]
+        
+        # PRNG Key
+        key = jax.random.PRNGKey(42) # TODO: Pass seed
+        
+        # Batching logic
+        # Optimize batch size based on memory
+        # Bucketing handles cond_dim variations
         
         # Prepare batched inputs
         n_links = i_flat.shape[0]
         # Use conservative batch size to avoid OOM - moderate improvement from 16 to 64
+        # 64 is safe (approx 1.2GB peak memory), bucketing provides the speedup
         batch_size = 64
         n_batches = (n_links + batch_size - 1) // batch_size
         n_padded = n_batches * batch_size
@@ -512,30 +617,139 @@ class PCMCI:
         j_batched = j_padded.reshape(n_batches, batch_size)
         tau_batched = tau_padded.reshape(n_batches, batch_size)
         
-        # Use a single key per iteration, split inside the JIT function
-        key, base_key = jax.random.split(key)
-
-        for cond_dim in iterator:
-            # Check convergence
-            degrees = jnp.sum(parents_mask, axis=(0, 2))
-            max_degree = jnp.max(degrees)
-            if cond_dim > 0 and max_degree < cond_dim:
-                break
-            
-            # Run scanned kernel
-            pvals_batched = self._run_pc_scanned(
-                data_values, parents_mask, cond_dim,
-                i_batched, j_batched, tau_batched, base_key,
-                max_subsets, pc_alpha, tau_max, max_cond_dim_limit
-            )
-            
-            pvals_flat = pvals_batched.reshape(-1)[:n_links]
-            pvals_grid = pvals_flat.reshape(self.N, self.N, tau_max + 1)
-            
-            should_remove = pvals_grid > pc_alpha
-            parents_mask = jnp.logical_and(parents_mask, jnp.logical_not(should_remove))
+        key, loop_key = jax.random.split(key)
 
         if self.verbosity >= 1:
+            print("Starting JIT-compiled PC Phase...")
+
+        # Initialize separate sets mask (N, N, tau_max+1, N, tau_max+1)
+        # But here we just return (parents_mask, sepsets_mask)
+        # Actually initializing such a huge tensor might be costly? (10,10,6,10,6) is small.
+        # But if N is large (e.g. 100) -> 100^2*6*100*6 is big.
+        # For now assume N is small as per benchmarks (N=10).
+        sepsets_mask = jnp.zeros(
+            (self.N, self.N, tau_max + 1, self.N, tau_max + 1), 
+            dtype=jnp.bool_
+        )
+
+        parents_mask, sepsets_mask = self._run_pc_loop(
+            parents_mask,
+            sepsets_mask,
+            data_values,
+            i_batched,
+            j_batched,
+            tau_batched,
+            loop_key,
+            max_subsets,
+            pc_alpha,
+            tau_max,
+            max_cond_dim_limit
+        )
+        # Block until ready to ensure timing captures computation
+        parents_mask.block_until_ready()
+
+        if self.verbosity >= 1:
+            # Need to pull mask to CPU for sum
+            total_parents = jnp.sum(parents_mask).item()
+            print(f"JIT PC phase complete: {total_parents} total parent links")
+
+        return self._mask_to_dict(parents_mask)
+
+    def run_pc_stable(
+        self,
+        tau_max: int = 1,
+        tau_min: int = 1,
+        pc_alpha: Optional[float] = 0.05,
+        max_conds_dim: Optional[int] = None,
+        max_subsets: int = 100,
+    ) -> Dict[int, Set[Tuple[int, int]]]:
+        """
+        Run the PC-stable condition selection algorithm (JIT-compiled internals).
+        """
+        # Initialization
+        parents_mask = jnp.ones((self.N, self.N, tau_max + 1), dtype=bool)
+        # Remove self-loops at lag 0
+        parents_mask = parents_mask.at[jnp.arange(self.N), jnp.arange(self.N), 0].set(False)
+        # Apply tau_min
+        if tau_min > 0:
+            parents_mask = parents_mask.at[:, :, :tau_min].set(False)
+        
+        if pc_alpha is None:
+            return self._mask_to_dict(parents_mask)
+
+        max_dim = max_conds_dim if max_conds_dim is not None else self.N * tau_max
+        max_cond_dim_limit = max_dim
+
+        # Extract data values for JIT
+        data_values = self.datahandler.values
+        
+        # Check T_eff
+        T_full = data_values.shape[0]
+        if T_full <= tau_max:
+             raise ValueError("Data length must be greater than tau_max")
+
+        key = jax.random.PRNGKey(42)
+        
+        # Pre-compute grid indices
+        i_idx, j_idx, tau_idx = jnp.meshgrid(
+            jnp.arange(self.N), jnp.arange(self.N), jnp.arange(tau_max + 1), indexing='ij'
+        )
+        i_flat = i_idx.reshape(-1)
+        j_flat = j_idx.reshape(-1)
+        tau_flat = tau_idx.reshape(-1)
+        
+        # Prepare batched inputs
+        n_links = i_flat.shape[0]
+        # Use conservative batch size to avoid OOM - moderate improvement from 16 to 64
+        # 64 is safe (approx 1.2GB peak memory), bucketing provides the speedup
+        batch_size = 64
+        n_batches = (n_links + batch_size - 1) // batch_size
+        n_padded = n_batches * batch_size
+        
+        # Pad indices
+        pad_len = n_padded - n_links
+        i_padded = jnp.pad(i_flat, (0, pad_len), constant_values=0)
+        j_padded = jnp.pad(j_flat, (0, pad_len), constant_values=0)
+        tau_padded = jnp.pad(tau_flat, (0, pad_len), constant_values=0)
+        
+        # Reshape for scan/map: (n_batches, batch_size)
+        i_batched = i_padded.reshape(n_batches, batch_size)
+        j_batched = j_padded.reshape(n_batches, batch_size)
+        tau_batched = tau_padded.reshape(n_batches, batch_size)
+        
+        key, loop_key = jax.random.split(key)
+
+        if self.verbosity >= 1:
+            print("Starting JIT-compiled PC Phase...")
+
+        # Initialize separate sets mask (N, N, tau_max+1, N, tau_max+1)
+        # But here we just return (parents_mask, sepsets_mask)
+        # Actually initializing such a huge tensor might be costly? (10,10,6,10,6) is small.
+        # But if N is large (e.g. 100) -> 100^2*6*100*6 is big.
+        # For now assume N is small as per benchmarks (N=10).
+        sepsets_mask = jnp.zeros(
+            (self.N, self.N, tau_max + 1, self.N, tau_max + 1), 
+            dtype=jnp.bool_
+        )
+
+        parents_mask, sepsets_mask = self._run_pc_loop(
+            parents_mask,
+            sepsets_mask,
+            data_values,
+            i_batched,
+            j_batched,
+            tau_batched,
+            loop_key,
+            max_subsets,
+            pc_alpha,
+            tau_max,
+            max_cond_dim_limit
+        )
+        # Block until ready to ensure timing captures computation
+        parents_mask.block_until_ready()
+
+        if self.verbosity >= 1:
+            # Need to pull mask to CPU for sum
             total_parents = jnp.sum(parents_mask).item()
             print(f"JIT PC phase complete: {total_parents} total parent links")
 
@@ -555,27 +769,57 @@ class PCMCI:
         pc_alpha: float,
         tau_max: int,
         max_cond_dim_limit: int,
-    ) -> jax.Array:
+    ) -> Tuple[jax.Array, jax.Array]:
         """
         Run batches of PC tests using lax.map to avoid OOM.
+        Uses bucketed kernels (lax.switch) to optimize for cond_dim.
+        Returns (all_pvals, all_cond_masks).
         """
         # Generate keys for each batch
         n_batches = i_batched.shape[0]
         batch_size = i_batched.shape[1]
         batch_keys = jax.random.split(base_key, n_batches)
+
+        # Define buckets for max_cond_dim_limit optimization
+        # Reduced buckets to improve compilation time while maintaining performance
+        possible_limits = [0, 1, 2, 4, 8, 16, 32]
+        # Filter to only use buckets <= max_cond_dim_limit
+        buckets = [l for l in possible_limits if l < max_cond_dim_limit]
+        buckets.append(max_cond_dim_limit)
+        buckets = sorted(list(set(buckets))) # unique and sorted
+        
+        # Create branches for switch
+        branches = []
+        for limit in buckets:
+            # Capture limit in closure (partial-like)
+            def make_branch(l_val):
+                def branch_impl(args):
+                    b_i, b_j, b_tau, b_key = args
+                    elem_keys = jax.random.split(b_key, batch_size)
+                    # Returns (pvals, cond_masks)
+                    return self._pc_batch_kernel(
+                        data_values, mask, cond_dim,
+                        b_i, b_j, b_tau, elem_keys,
+                        max_subsets, pc_alpha, tau_max, l_val
+                    )
+                return branch_impl
+            branches.append(make_branch(limit))
+            
+        # Select bucket index
+        bucket_arr = jnp.array(buckets)
+        # Find first bucket >= cond_dim
+        # cond_dim is scalar here usually? 
+        # _run_pc_loop calls this with scalar cond_dim, but it's a tracer.
+        idx = jnp.argmax(bucket_arr >= cond_dim)
         
         def body_fun(args):
-            b_i, b_j, b_tau, b_key = args
-            # Split the batch key into per-element keys
-            elem_keys = jax.random.split(b_key, batch_size)
-            return self._pc_batch_kernel(
-                data_values, mask, cond_dim,
-                b_i, b_j, b_tau, elem_keys,
-                max_subsets, pc_alpha, tau_max, max_cond_dim_limit
-            )
-        
+            # args is (b_i, b_j, b_tau, b_key)
+            # Returns tuple (pvals, cond_masks)
+            return jax.lax.switch(idx, branches, args)
+    
         # lax.map over the batch dimension (axis 0 of inputs)
         xs = (i_batched, j_batched, tau_batched, batch_keys)
+        # lax.map will unpack tuple returns into a tuple of arrays
         return jax.lax.map(body_fun, xs)
 
     def _pc_batch_kernel(
@@ -591,7 +835,7 @@ class PCMCI:
         pc_alpha: float,
         tau_max: int,
         max_cond_dim_limit: int,
-    ) -> jax.Array:
+    ) -> Tuple[jax.Array, jax.Array]:
         """Run PC tests for a batch of links with optimized data access."""
         
         # Pre-compute commonly used values
@@ -658,18 +902,35 @@ class PCMCI:
                     n_conditions=cond_dim
                 )
                 
-                return jnp.max(p_vals)
+                # Find best p-value and corresponding sepset
+                max_idx = jnp.argmax(p_vals)
+                max_pval = p_vals[max_idx]
+                
+                # Extract winning sepset info
+                winning_c_vars = c_vars_all[max_idx]
+                winning_c_lags = c_lags_all[max_idx]
+                
+                # Create mask (N, tau_max+1)
+                cond_mask = jnp.zeros((self.N, tau_max + 1), dtype=jnp.bool_)
+                # Use col_mask to only set valid entries to True
+                cond_mask = cond_mask.at[winning_c_vars, winning_c_lags].set(col_mask)
+                
+                return max_pval, cond_mask
 
+            empty_mask = jnp.zeros((self.N, tau_max + 1), dtype=jnp.bool_)
             return jax.lax.cond(
                 can_test,
                 perform_test,
-                lambda k: jnp.float32(0.0) if get_config().dtype == jnp.float32 else 0.0,
+                lambda k: (
+                    jnp.float32(0.0) if get_config().dtype == jnp.float32 else 0.0,
+                    empty_mask
+                ),
                 key_in
             )
 
         # Use keys directly - they are already (batch_size, 2) from split
-        all_pvals = jax.vmap(test_one_link)(i_flat, j_flat, tau_flat, keys)
-        return all_pvals
+        all_pvals, all_cond_masks = jax.vmap(test_one_link)(i_flat, j_flat, tau_flat, keys)
+        return all_pvals, all_cond_masks
 
     def _mask_to_dict(self, mask: jax.Array) -> Dict[int, Set[Tuple[int, int]]]:
         """Convert boolean mask to dictionary of parent sets."""
@@ -915,9 +1176,27 @@ class PCMCI:
         """
         Run MCI phase using batched operations for efficiency.
         """
-        # We collect all tests to be run
-        test_specs = []
+        """
+        Run MCI phase using batched operations for efficiency.
+        """
+        # Collect test specifications
+        # Convert parents to a more accessible structure or just iterate once to build arrays
         
+        # Lists to build arrays
+        i_list, j_list, tau_list = [], [], []
+        cond_vars_list, cond_lags_list = [], []
+        n_conds_list = []
+        
+        # First pass: collect all tests and find max conditioning set size
+        max_cond_size = 0
+        
+        # We can iterate over tests in Python since it's just building lists (fast enough compared to testing)
+        # But for truly large graphs we might want to JIT this too. detailed in plan: we stick to Python for list construction
+        # as the bottleneck is the `run_batch` calls inside the loop, not the list building itself.
+        
+        if self.verbosity >= 1:
+            pbar = tqdm(total=self.N * self.N * (tau_max - tau_min + 1), desc="MCI Prep")
+
         for j in self.selected_variables:
             parents_j = list(parents.get(j, set()))
             
@@ -936,93 +1215,115 @@ class PCMCI:
                         if new_lag <= 0:
                             cond_set.add((p_var, new_lag))
                             
-                    cond_list = sorted(list(cond_set)) # Sort for stability
+                    cond_list = sorted(list(cond_set))
                     
-                    # Apply max_conds limits
+                    # Apply limits if needed (same logic as before)
                     if max_conds_py is not None or max_conds_px is not None:
-                        # Separate into parents of Y and parents of X
                         py_conds = [(v, l) for v, l in cond_list if (v, l) in parents_j or (v, l-tau) in parents_j]
                         px_conds = [(v, l) for v, l in cond_list if (v, l) not in py_conds]
-                        
-                        # Apply limits
-                        if max_conds_py is not None:
-                            py_conds = py_conds[:max_conds_py]
-                        if max_conds_px is not None:
-                            px_conds = px_conds[:max_conds_px]
-                            
+                        if max_conds_py is not None: py_conds = py_conds[:max_conds_py]
+                        if max_conds_px is not None: px_conds = px_conds[:max_conds_px]
                         cond_list = sorted(py_conds + px_conds)
                     
-                    test_specs.append({
-                        'i': i, 'j': j, 'tau': tau,
-                        'conds': cond_list
-                    })
-
+                    n_c = len(cond_list)
+                    max_cond_size = max(max_cond_size, n_c)
                     
-        if not test_specs:
-            return jnp.zeros((self.N, self.N, tau_max + 1)), jnp.ones((self.N, self.N, tau_max + 1))
-            
-        # Group by conditioning set size for efficient batching
-        specs_by_dim = {}
-        for spec in test_specs:
-            dim = len(spec['conds'])
-            if dim not in specs_by_dim:
-                specs_by_dim[dim] = []
-            specs_by_dim[dim].append(spec)
-            
-        final_val = jnp.zeros((self.N, self.N, tau_max + 1))
-        # Initialize p-values to 1.0 (not significant)
-        final_pval = jnp.ones((self.N, self.N, tau_max + 1))
-        
-        # Process each group
-        if self.verbosity >= 1:
-            pbar = tqdm(total=len(test_specs), desc="MCI Tests")
-            
-        for dim, specs in specs_by_dim.items():
-            # Create batches - use conservative batch size to avoid OOM
-            batch_size = 2048  # Reasonable for most GPUs
-            
-            for k in range(0, len(specs), batch_size):
-                batch = specs[k:k+batch_size]
-                
-                i_s =  [b['i'] for b in batch]
-                j_s =  [b['j'] for b in batch]
-                tau_s = [b['tau'] for b in batch]
-                
-                cond_vars = []
-                cond_lags = []
-                
-                if dim > 0:
-                    for b in batch:
-                        cv = [c[0] for c in b['conds']]
-                        cl = [-c[1] for c in b['conds']]
-                        cond_vars.append(cv)
-                        cond_lags.append(cl)
-                
-                # Get batch data
-                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                    jnp.array(i_s), jnp.array(j_s), jnp.array(tau_s),
-                    jnp.array(cond_vars) if dim > 0 else None,
-                    jnp.array(cond_lags) if dim > 0 else None,
-                    max_lag=tau_max
-                )
-                
-                statistics, pvals = self.test.run_batch(X_b, Y_b, Z_b)
-                
-                # Vectorized scatter back to matrix using advanced indexing
-                # Convert lists to arrays for indexing
-                i_arr = jnp.array(i_s)
-                j_arr = jnp.array(j_s)
-                tau_arr = jnp.array(tau_s)
-                
-                # Use vectorized .at[] operation with tuple indexing
-                final_val = final_val.at[i_arr, j_arr, tau_arr].set(statistics)
-                final_pval = final_pval.at[i_arr, j_arr, tau_arr].set(pvals)
+                    i_list.append(i)
+                    j_list.append(j)
+                    tau_list.append(tau)
                     
-                if self.verbosity >= 1:
-                    pbar.update(len(batch))
+                    # Store conditions temporarily
+                    c_vars = [c[0] for c in cond_list]
+                    c_lags = [-c[1] for c in cond_list]
+                    cond_vars_list.append(c_vars)
+                    cond_lags_list.append(c_lags)
+                    n_conds_list.append(n_c)
                     
         if self.verbosity >= 1:
             pbar.close()
             
-        return final_val, final_pval
+        if not i_list:
+             return jnp.zeros((self.N, self.N, tau_max + 1)), jnp.ones((self.N, self.N, tau_max + 1))
+
+        # Pad conditioning sets
+        n_tests = len(i_list)
+        
+        # If no conditions at all
+        if max_cond_size == 0:
+             # run unconditional
+             i_arr = jnp.array(i_list, dtype=jnp.int32)
+             j_arr = jnp.array(j_list, dtype=jnp.int32)
+             tau_arr = jnp.array(tau_list, dtype=jnp.int32)
+             
+             X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                 i_arr, j_arr, tau_arr, None, None, max_lag=tau_max
+             )
+             statistics, pvals = self.test.run_batch(X_b, Y_b, Z_b)
+             
+        else:
+            # Create padded arrays
+            cond_vars_padded = np.zeros((n_tests, max_cond_size), dtype=int)
+            cond_lags_padded = np.zeros((n_tests, max_cond_size), dtype=int)
+            
+            for idx, (cv, cl) in enumerate(zip(cond_vars_list, cond_lags_list)):
+                k = len(cv)
+                if k > 0:
+                    cond_vars_padded[idx, :k] = cv
+                    cond_lags_padded[idx, :k] = cl
+            
+            # Move to JAX
+            i_arr = jnp.array(i_list, dtype=jnp.int32)
+            j_arr = jnp.array(j_list, dtype=jnp.int32)
+            tau_arr = jnp.array(tau_list, dtype=jnp.int32)
+            cv_arr = jnp.array(cond_vars_padded, dtype=jnp.int32)
+            cl_arr = jnp.array(cond_lags_padded, dtype=jnp.int32)
+            n_conds_arr = jnp.array(n_conds_list, dtype=jnp.int32)
+            
+            if self.verbosity >= 1:
+                print(f"Running {n_tests} MCI tests in batch (max cond size: {max_cond_size})")
+
+            # Get data
+            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                i_arr, j_arr, tau_arr, cv_arr, cl_arr, max_lag=tau_max
+            )
+            
+            # Mask Z: Zero out invalid columns
+            # Z_b shape: (batch, n_cond, T_eff) ?? No, get_variable_pair_batch transpose checks...
+            # DataHandler returns: (batch, effective_T, n_cond) from transpose(0, 2, 1)
+            # Actually let's check DataHandler: 
+            # Z = Z_flat.reshape(batch_size, n_cond, effective_T).transpose(0, 2, 1) 
+            # -> (batch, effective_T, n_cond) which is what ParCorr expects usually as (n_samples, n_conditions) in Z?
+            # Wait, ParCorr run_batch expects Z_batch as (n_tests, n_samples, n_conditions)?
+            # ParCorr._batch_partial_correlation_jit takes X(n, T), Y(n, T), Z(n, T, cond) ??
+            # Let's verify ParCorr signature.
+            # _compute_partial_correlation_jit takes Z as (T, cond) or (cond, T) -> ensure 2D.
+            # Code says: Z = jnp.atleast_2d(Z); if Z.shape[0] == 1 and ... T ... -> Transpose.
+            # _batch_partial_correlation_jit uses vmap over (0, 0, 0).
+            # So Z_batch must be (batch, ..., ...) corresponding to X_batch (batch, T).
+            
+            # Data handler returns Z: (batch, effective_T, n_cond).
+            # This aligns with vmapping over batch dimension.
+            
+            # Masking: We need to zero out the columns in Z corresponding to padded conditions.
+            # Z is (batch, T, max_cond).
+            # mask should be (batch, 1, max_cond).
+            
+            mask = jnp.arange(max_cond_size) < n_conds_arr[:, None] # (batch, max_cond)
+            mask = mask[:, None, :] # (batch, 1, max_cond)
+            
+            Z_masked = Z_b * mask.astype(Z_b.dtype)
+            
+            statistics, pvals = self.test.run_batch(
+                X_b, Y_b, Z_masked, 
+                n_conditions=n_conds_arr  # Very important for DF calculation!
+            )
+
+        # Scatter results back
+        val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
+        pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
+        
+        val_matrix = val_matrix.at[i_arr, j_arr, tau_arr].set(statistics)
+        pval_matrix = pval_matrix.at[i_arr, j_arr, tau_arr].set(pvals)
+        
+        return val_matrix, pval_matrix
 
