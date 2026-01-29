@@ -169,6 +169,7 @@ class PCMCIConfig:
     gpu_preallocate: bool = True
     gpu_memory_fraction: Optional[float] = None
     gpu_allocator: Optional[str] = None
+    compilation_cache_dir: Optional[str] = None
     _previous_config: Optional["PCMCIConfig"] = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -235,6 +236,21 @@ class PCMCIConfig:
             )
         if self.gpu_allocator is not None:
             os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = self.gpu_allocator
+
+        # Configure compilation cache
+        if self.compilation_cache_dir is not None:
+            cache_dir = os.path.expanduser(self.compilation_cache_dir)
+            os.makedirs(cache_dir, exist_ok=True)
+            os.environ["JAX_COMPILATION_CACHE_DIR"] = cache_dir
+            if self.verbosity >= 2:
+                print(f"JAX compilation cache enabled: {cache_dir}")
+        elif "JAX_COMPILATION_CACHE_DIR" not in os.environ:
+            # Enable by default with a sensible location
+            default_cache = os.path.expanduser("~/.cache/jax_pcmci")
+            os.makedirs(default_cache, exist_ok=True)
+            os.environ["JAX_COMPILATION_CACHE_DIR"] = default_cache
+            if self.verbosity >= 1:
+                print(f"JAX compilation cache enabled (default): {default_cache}")
 
         if self.verbosity >= 2:
             print(f"Applied configuration: {self}")

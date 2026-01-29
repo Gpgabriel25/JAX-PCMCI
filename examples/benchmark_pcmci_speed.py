@@ -46,7 +46,18 @@ def _get_mem_usage_mb() -> float:
     except ImportError:
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
-def benchmark_run(label: str, fn) -> dict:
+def benchmark_run(label: str, fn, warmup: bool = True) -> dict:
+    if warmup:
+        try:
+            res = fn()
+            if hasattr(res, "block_until_ready"):
+                 res.block_until_ready()
+            elif hasattr(res, "val_matrix"):
+                 res.val_matrix.block_until_ready()
+            jax.block_until_ready(jnp.array(0))
+        except Exception:
+            pass # Warmup might fail if determinism checks etc, but usually fine
+
     jax.block_until_ready(jnp.array(0))  # clear pending
     start_mem = _get_mem_usage_mb()
     start_time = time.perf_counter()

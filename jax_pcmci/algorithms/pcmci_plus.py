@@ -170,7 +170,7 @@ class PCMCIPlus(PCMCI):
         max_conds_dim: Optional[int] = None,
         max_conds_py: Optional[int] = None,
         max_conds_px: Optional[int] = None,
-        max_subsets: int = 100,
+        max_subsets: int = 10,
         alpha_level: float = 0.05,
         fdr_method: Optional[str] = None,
         orientation_alpha: Optional[float] = None,
@@ -302,7 +302,7 @@ class PCMCIPlus(PCMCI):
         tau_min: int,
         pc_alpha: float,
         max_conds_dim: Optional[int],
-        max_subsets: int = 100,
+        max_subsets: int = 10,
     ) -> Tuple[Dict[int, Set[Tuple[int, int]]], Dict]:
         """
         Discover the skeleton (undirected graph) using PC-stable with Deep JIT.
@@ -436,7 +436,7 @@ class PCMCIPlus(PCMCI):
         other_adj: List[Tuple[int, int]],
         cond_dim: int,
         pc_alpha: float,
-        max_subsets: int = 100,
+        max_subsets: int = 10,
     ) -> Tuple[bool, Set[Tuple[int, int]]]:
         """
         Test independence with conditioning subsets.
@@ -713,71 +713,45 @@ class PCMCIPlus(PCMCI):
         if not test_specs:
             return val_matrix, pval_matrix
             
-        # Prepare Batch Arrays
         n_tests = len(test_specs)
-        i_list, j_list, tau_list, n_cond_list = [], [], [], []
-        cond_vars_list, cond_lags_list = [], []
         
+        # Group by condition size (Bucketing)
+        # This prevents zero-padding which causes singular matrices in ParCorr (Ridge Regression)
+        buckets = {}
         for spec in test_specs:
-            i_list.append(spec['i'])
-            j_list.append(spec['j'])
-            tau_list.append(spec['tau'])
-            n_cond_list.append(spec['n_cond'])
-            
-            # Pad conditions
-            c_vars = [c[0] for c in spec['conds']]
-            c_lags = [c[1] for c in spec['conds']]
-            
-            # Pad with 0s (variable 0, lag 0)
-            pad_len = max_cond_len - len(c_vars)
-            if pad_len > 0:
-                c_vars.extend([0] * pad_len)
-                c_lags.extend([0] * pad_len)
-                
-            cond_vars_list.append(c_vars)
-            cond_lags_list.append(c_lags)
-            
-        i_arr = jnp.asarray(i_list, dtype=jnp.int32)
-        j_arr = jnp.asarray(j_list, dtype=jnp.int32)
-        tau_arr = jnp.asarray(tau_list, dtype=jnp.int32)
-        n_cond_arr = jnp.asarray(n_cond_list, dtype=jnp.int32)
-        
-        if max_cond_len > 0:
-            cond_vars = jnp.asarray(cond_vars_list, dtype=jnp.int32)
-            cond_lags = jnp.asarray(cond_lags_list, dtype=jnp.int32)
-        else:
-            cond_vars = None
-            cond_lags = None
+            n_c = spec['n_cond']
+            if n_c not in buckets:
+                buckets[n_c] = []
+            buckets[n_c].append(spec)
 
         if self.verbosity >= 1:
-            print(f"Running vectorized MCI+ (Tests: {n_tests}, Max Max Lag: {global_max_lag})...")
+            print(f"Running vectorized MCI+ (Tests: {n_tests}, Buckets: {len(buckets)}, Max Max Lag: {global_max_lag})...")
 
-        # Run Batched Test
-        # Batch size handling to avoid OOM for extremely large graphs
-        # For N=50, tests ~ 12000. Batch size 4096 is fine.
-        max_batch_size = 4096
-        
-        for start_idx in range(0, n_tests, max_batch_size):
-            end_idx = min(start_idx + max_batch_size, n_tests)
+        # Process each bucket
+        for n_c, bucket in buckets.items():
+            # Extract batch indices
+            b_i = jnp.array([s['i'] for s in bucket], dtype=jnp.int32)
+            b_j = jnp.array([s['j'] for s in bucket], dtype=jnp.int32)
+            b_tau = jnp.array([s['tau'] for s in bucket], dtype=jnp.int32)
             
-            b_i = i_arr[start_idx:end_idx]
-            b_j = j_arr[start_idx:end_idx]
-            b_tau = tau_arr[start_idx:end_idx]
-            b_n_cond = n_cond_arr[start_idx:end_idx]
-            
-            if max_cond_len > 0:
-                b_c_vars = cond_vars[start_idx:end_idx]
-                b_c_lags = cond_lags[start_idx:end_idx]
-                
-                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                    b_i, b_j, b_tau, b_c_vars, b_c_lags, max_lag=global_max_lag
-                )
+            # Prepare conditions
+            if n_c > 0:
+                # No padding needed!
+                # Conditions are already sorted tuples in spec['conds']
+                c_vars = jnp.array([[c[0] for c in s['conds']] for s in bucket], dtype=jnp.int32)
+                c_lags = jnp.array([[c[1] for c in s['conds']] for s in bucket], dtype=jnp.int32)
             else:
-                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                    b_i, b_j, b_tau, max_lag=global_max_lag
-                )
+                c_vars = None
+                c_lags = None
                 
-            stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, n_conditions=b_n_cond)
+            # Get Data Batch
+            # Z_b will be exactly (batch, effective_T, n_c)
+            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                b_i, b_j, b_tau, c_vars, c_lags, max_lag=global_max_lag
+            )
+            
+            # Run Batched Test
+            stats, pvals = self.test.run_batch(X_b, Y_b, Z_b, n_conditions=n_c)
             
             # Scatter results
             val_matrix = val_matrix.at[b_i, b_j, b_tau].set(stats)

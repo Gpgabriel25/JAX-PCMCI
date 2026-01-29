@@ -1,0 +1,42 @@
+JAX Backend: [CudaDevice(id=0)]
+
+[Warmup] Compiling JAX functions (N=5, tau_max=2)...
+
+============================================================
+PCMCI: Phase 1 - PC Condition Selection
+============================================================
+Starting JIT-compiled PC Phase...
+JIT PC phase complete: 4 total parent links
+
+============================================================
+PCMCI: Phase 2 - MCI Tests
+============================================================
+MCI Prep:   0%|          | 0/50 [00:00<?, ?it/s]MCI Prep:   0%|          | 0/50 [00:00<?, ?it/s]
+Processing 7 buckets of different condition sizes...
+
+============================================================
+PCMCI Results Summary
+============================================================
+Test: ParCorr
+Variables: 5
+Tau range: 1 to 2
+Alpha level: 0.05
+FDR correction: None
+
+Significant links found: 2
+  - Lagged (tau>0): 2
+
+Top links by strength:
+------------------------------------------------------------
+  X3(t-1) -> X0(t): stat=-0.1961, p=0.0020 **
+  X4(t-1) -> X0(t): stat=-0.1534, p=0.0159 *
+============================================================
+[Warmup] Compilation/Warmup took: 30.7060s
+
+[Benchmark] Running PCMCI (1 repeats)...
+Run 1: 0.2025s (Phase 1: 0.0839s, Phase 2: 0.1185s)
+
+[Summary] PCMCI
+Average Runtime: 0.2025s ± 0.0000s
+Compilation Time: 30.71s
+Compile/Run Ratio: 151.7x

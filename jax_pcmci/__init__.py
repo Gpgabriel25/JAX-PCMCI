@@ -60,6 +60,7 @@ from jax_pcmci.parallel import (
     batch_independence_tests,
     benchmark_parallel_modes,
 )
+from jax_pcmci import precompile
 
 __all__ = [
     # Version
@@ -87,4 +88,7 @@ __all__ = [
     "parallel_map",
     "batch_independence_tests",
     "benchmark_parallel_modes",
+    # Precompilation
+    "precompile",
 ]
+

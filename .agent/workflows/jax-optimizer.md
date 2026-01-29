@@ -34,7 +34,11 @@ Focus on a single bottleneck (e.g., Python loops in hot code, redundant data mov
 Decide (Plan a Single Fix)
 
 One change only. Prefer JAX-native vectorization, reducing Python overhead, or better batch sizing via PCMCIConfig.
-Do not trade runtime speed for compilation speed.
+**Proven Strategies**:
+- **Deep JIT**: Replace top-level Python loops with `jax.lax.while_loop` or `jax.lax.scan` to enable end-to-end compilation. This is critical for Phase 1 (PC).
+- **Bucketing**: For ragged data (e.g., varying condition set sizes in Phase 3), DO NOT use zero-padding if the downstream estimator (like `ParCorr` with Ridge Regression) is sensitive to singular matrices. Instead, group data into buckets by size and execute batched kernels per bucket.
+- **Kernel Merging**: Use `jax.lax.switch` to dispatch to specialized kernels based on data shape (e.g., condition dimension) to avoid recompilation while keeping kernels optimal.
+Do not trade runtime speed for compilation speed (unless compilation becomes < 1 min for > 10 min runs).
 Act (Implement Fix)
 
 Apply the change in minimal scope.
