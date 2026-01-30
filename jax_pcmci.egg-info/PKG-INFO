@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: jax-pcmci
-Version: 1.2.0
+Version: 1.3.0
 Summary: High-performance causal discovery using PCMCI algorithms with JAX acceleration
 Author: JAX-PCMCI Contributors
 License: MIT
@@ -37,7 +37,7 @@ Requires-Dist: mypy>=1.0.0; extra == "dev"
 Requires-Dist: pre-commit>=3.0.0; extra == "dev"
 Provides-Extra: docs
 Requires-Dist: sphinx>=6.0.0; extra == "docs"
-Requires-Dist: sphinx-rtd-theme>=1.2.0; extra == "docs"
+Requires-Dist: sphinx-rtd-theme>=1.3.0; extra == "docs"
 Requires-Dist: sphinx-autodoc-typehints>=1.22.0; extra == "docs"
 Requires-Dist: nbsphinx>=0.9.0; extra == "docs"
 Requires-Dist: myst-parser>=1.0.0; extra == "docs"
