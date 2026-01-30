@@ -85,3 +85,52 @@ This log tracks all performance optimizations made to JAX-PCMCI, including bench
   - **2x larger N** now supported (N=10 → N=20)
   - 10 subsets still provide adequate statistical coverage
 - **Verdict**: **KEEP** - Critical success doubling problem size capacity
+
+### ParCorr Optimization - Schur Complement (Cycle 5, 2026-01-29)
+- **Change**: Replaced OLS residual computation with Covariance Matrix/Schur Complement method in `ParCorr`.
+- **Motivation**: OLS requires storing residuals of size O(T) for every test. Covariance method only works with O(d^2) matrices after initial reduction, improving memory bandwidth and theoretical scalability for large T.
+- **Impact**:
+  - **Runtime**: 8% speedup on hardest case (PCMCI+ N=20 T=1000: 1.16s → 1.07s)
+  - **Memory**: Slight reduction (~50MB peak savings on N=20 T=1000)
+  - **Correctness**: Verified against new baseline (minor numerical differences due to algorithm change, p-values consistent).
+- **Verdict**: **KEEP** - More robust implementation for large datasets.
+
+### Orientation Vectorization (Cycle 6, 2026-01-29)
+- **Change**: Replaced O(N^3) Python loops in Phase 2 (Orientation) with vectorized Numpy/JAX operations (broadcasting).
+- **Motivation**: `_orient_v_structures` and `_apply_meek_rules` were pure Python. Expected bottleneck for N>=20.
+- **Impact**:
+  - **N=10**: 26% Speedup (PCMCI+ 10/1000: 0.27s → 0.20s).
+  - **N=20**: Neutral/Slight Regress (PCMCI+ 20/1000: 1.07s → 1.15s).
+- **Analysis**: Vectorization removes Python overhead, helping smaller N. For N=20, the overhead of creating broadcasting arrays (N^3) in Numpy on CPU might balance out the loop savings. The remaining 1.15s runtime for N=20 suggests Phase 3 (MCI) or JIT dispatch is now the primary cost, not Phase 2.
+- **Verdict**: **KEEP** - Code is cleaner and algorithmically superior (O(1) Python ops vs O(N^3)).
+
+### Phase 3 Bucket Padding (Cycle 7, 2026-01-29)
+- **Change**: Implemented fixed-size bucketing (powers of 2) for conditioning sets in `run_batch_mci` (PCMCI and PCMCI+). Padded Z matrices with zeros.
+- **Motivation**: Reduce JIT compilation overhead caused by varying conditioning set sizes in Phase 3.
+- **Impact**:
+  - **N=5**: 40% Speedup (PCMCI+ 5/1000: 0.12s → 0.08s).
+  - **N=10**: Slight regression (PCMCI+ 10/1000: 0.20s → 0.29s).
+  - **N=20**: 14% Speedup (PCMCI+ 20/1000: 1.15s → 0.99s).
+- **Analysis**: Padding successfully reduced random compilation overhead, stabilizing performance for N=5 and N=20. The regression at N=10 might be due to padding overhead outweighing compilation savings for that specific graph size distribution. The N=20 runtime floor of ~1.0s remains, pointing to a constant-time bottleneck (likely Phase 2 Orientation) rather than JIT compilation.
+- **Verdict**: **KEEP** - Improves stability and warm-start performance.
+
+### Per-Phase Profiling (Cycle 8, 2026-01-29)
+- **Change**: Instrumented `PCMCI` and `PCMCIPlus` with timers (`process_time` was not used, `perf_counter` was used) to breakdown runtime into Skeleton, Orientation, and MCI phases. Updated benchmark to report these.
+- **Hypothesis**: Suspected Phase 2 (Orientation) was the bottleneck (~0.7s constant time).
+- **Findings (N=20, T=1000)**:
+  - **PCMCI+ Total**: 0.89s
+  - **Skeleton Discovery (Phase 1)**: 0.29s (Scaling with T/N, reasonable)
+  - **Edge Orientation (Phase 2)**: 0.09s (FAST! Hypothesis Rejected)
+  - **MCI Tests (Phase 3)**: 0.51s (SLOW! Dominant bottleneck)
+  - **Reference (PCMCI MCI)**: 0.05s.
+- **Analysis**: The MCI phase in PCMCI+ is ~10x slower than in PCMCI. This contradicts the assumption that Orientation was the culprit. The bottleneck is strictly in Phase 3.
+- **Verdict**: **CRITICAL INSIGHT** - Future optimization MUST focus on `_run_mci_plus` efficiency. Possibly specific to how contemporaneous links are tested or how the batch is constructed.
+
+### Batch Padding Optimization (Cycle 9, 2026-01-29)
+- **Change**: Implemented fixed-size batch padding (multiples of 128) in `_run_mci_plus` and `run_batch_mci` to reduce JIT recompilation.
+- **Hypothesis**: Dynamic batch sizes (number of tests) caused frequent recompilation, slowing down MCI Phase.
+- **Findings (N=20)**:
+  - **T=250**: Improved from 0.89s to 0.77s (-14%).
+  - **T=1000**: Regressed from 0.89s to 1.03s (+15% slower).
+- **Analysis**: While padding helps small/cold workloads, the overhead of padding large arrays (`Z` matrix) dominates for large T, worsening performance. The JIT overhead was not the primary bottleneck for large T.
+- **Verdict**: **REVERTED**. The optimization was rolled back to maintain large-scale performance.

@@ -109,46 +109,72 @@ def _compute_correlation_jit(X: jax.Array, Y: jax.Array) -> jax.Array:
 @jax.jit
 def _compute_partial_correlation_jit(X: jax.Array, Y: jax.Array, Z: jax.Array) -> jax.Array:
     """
-    Compute partial correlation via OLS residuals (standalone JITted version).
-    Optimized to reuse Cholesky factorization for X and Y regressions.
+    Compute partial correlation via Schur complement of Covariance Matrix.
+    
+    This method is more memory efficient than the residual method as it avoids
+    storing O(T) residuals, instead working with O(d^2) covariance matrices.
+    
+    Method:
+    1. Construct data matrix D = [X, Y, Z]
+    2. Compute Covariance Matrix Sigma = D.T @ D
+    3. Compute Schur complement to get conditional covariance of {X,Y} given Z
+    4. Normalize to get correlation
     """
     # Ensure Z is 2D
     Z = jnp.atleast_2d(Z)
     if Z.shape[0] == 1 and Z.shape[1] != X.shape[0]:
         Z = Z.T
-        
-    # Center data
-    Z_c = Z - jnp.mean(Z, axis=0)
-    X_c = X - jnp.mean(X)
-    Y_c = Y - jnp.mean(Y)
+
+    # 1. Construct Data Matrix D = [X, Y, Z]
+    # Shape: (T, 2 + dim_Z)
+    # Stacking column-wise
+    D = jnp.column_stack([X, Y, Z])
     
-    # Solve normal equations: (Z^T Z) beta = Z^T target
-    # We factorize Z^T Z once and use it for both X and Y
-    gram = Z_c.T @ Z_c
-    ridge = 1e-6 * jnp.eye(gram.shape[0], dtype=gram.dtype)
+    # 2. Compute Covariance (Unnormalized is fine for correlation)
+    # Center the data first
+    D_centered = D - jnp.mean(D, axis=0)
+    Sigma = D_centered.T @ D_centered
     
-    # Cholesky factorization
-    # (c, lower) is the format used by cho_solve
-    # c is the factor, lower=True means L in LL^T
-    L_and_lower = linalg.cho_factor(gram + ridge, lower=True)
+    # 3. Extract Blocks
+    # Indices: 0->X, 1->Y, 2+ -> Z
+    # Sigma_AA = Sigma[0:2, 0:2] (Covariance of X,Y)
+    # Sigma_AB = Sigma[0:2, 2:]  (Cross-cov with Z)
+    # Sigma_BB = Sigma[2:, 2:]   (Covariance of Z)
     
-    # Regress X on Z
-    rhs_X = Z_c.T @ X_c
-    coeffs_X = linalg.cho_solve(L_and_lower, rhs_X)
-    rX = X_c - Z_c @ coeffs_X
+    Sigma_AA = Sigma[:2, :2]
+    Sigma_AB = Sigma[:2, 2:]
+    Sigma_BB = Sigma[2:, 2:]
     
-    # Regress Y on Z
-    rhs_Y = Z_c.T @ Y_c
-    coeffs_Y = linalg.cho_solve(L_and_lower, rhs_Y)
-    rY = Y_c - Z_c @ coeffs_Y
+    # 4. Compute Schur Complement: S = A - B D^-1 C
+    # Here: Cond_Cov = Sigma_AA - Sigma_AB @ Sigma_BB^-1 @ Sigma_AB.T
     
-    # Compute correlation of centered residuals
-    num = jnp.sum(rX * rY)
-    den = jnp.sqrt(jnp.sum(rX**2) * jnp.sum(rY**2))
+    # Regularize Sigma_BB for stability
+    n_z = Sigma_BB.shape[0]
+    ridge = 1e-6 * jnp.eye(n_z, dtype=Sigma.dtype)
     
+    # Solve linear system: Sigma_BB @ W = Sigma_AB.T  =>  W = Sigma_BB^-1 @ Sigma_AB.T
+    # We use Cholesky for stability
+    L_and_lower = linalg.cho_factor(Sigma_BB + ridge, lower=True)
+    W = linalg.cho_solve(L_and_lower, Sigma_AB.T)
+    
+    # Cond_Cov = Sigma_AA - Sigma_AB @ W
+    Cond_Cov = Sigma_AA - Sigma_AB @ W
+    
+    # 5. Extract Partial Correlation
+    # Cov(X,Y|Z) = Cond_Cov[0, 1]
+    # Var(X|Z)   = Cond_Cov[0, 0]
+    # Var(Y|Z)   = Cond_Cov[1, 1]
+    
+    cov_xy = Cond_Cov[0, 1]
+    var_x = Cond_Cov[0, 0]
+    var_y = Cond_Cov[1, 1]
+    
+    denominator = jnp.sqrt(var_x * var_y)
+    
+    # Handle zero denominator
     correlation = jnp.where(
-        den > 1e-10,
-        num / den,
+        denominator > 1e-10,
+        cov_xy / denominator,
         0.0
     )
     

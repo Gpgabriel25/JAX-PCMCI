@@ -22,6 +22,7 @@ Example
 -------
 >>> from jax_pcmci import PCMCI, ParCorr, DataHandler
 >>> import jax.numpy as jnp
+>>> import time
 >>>
 >>> # Generate sample data
 >>> data = jnp.randn(1000, 5)
@@ -41,6 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 import math
+import time
 from itertools import combinations
 from functools import partial
 
@@ -166,6 +168,9 @@ class PCMCI:
         self._pval_matrix: Optional[jax.Array] = None
         self._val_matrix: Optional[jax.Array] = None
         self._batch_size_cache: Dict[Tuple[int, int], Optional[int]] = {}
+        
+        # Profiling timers
+        self.timers: Dict[str, float] = {}
 
     def _sample_condition_subsets(
         self,
@@ -366,12 +371,16 @@ class PCMCI:
         self._val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
         self._pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
 
+        # Initialize timers
+        self.timers = {}
+        
         # Phase 1: PC condition selection
         if self.verbosity >= 1:
             print(f"\n{'='*60}")
             print("PCMCI: Phase 1 - PC Condition Selection")
             print(f"{'='*60}")
-
+        
+        t0 = time.perf_counter()
         self._parents = self.run_pc_stable(
             tau_max=tau_max,
             tau_min=tau_min,
@@ -379,6 +388,7 @@ class PCMCI:
             max_conds_dim=max_conds_dim,
             max_subsets=max_subsets,
         )
+        self.timers['skeleton_discovery'] = time.perf_counter() - t0
 
         # Clear cache between phases to free memory
         self.datahandler.clear_cache()
@@ -389,6 +399,7 @@ class PCMCI:
             print("PCMCI: Phase 2 - MCI Tests")
             print(f"{'='*60}")
 
+        t0 = time.perf_counter()
         # Use batch MCI by default for GPU/TPU acceleration
         # Only falls back to sequential if batch test not available
         if hasattr(self.test, 'run_batch'):
@@ -407,6 +418,7 @@ class PCMCI:
                 max_conds_py=max_conds_py,
                 max_conds_px=max_conds_px,
             )
+        self.timers['mci_test'] = time.perf_counter() - t0
 
         # Store results
         self._val_matrix = val_matrix
@@ -1132,60 +1144,160 @@ class PCMCI:
 
         # Group by condition size (Bucketing) to avoid padding/masking issues
         # ParCorr is sensitive to zero-padding (singular matrix with ridge regression)
-        buckets = {}
+        # Optimized: Use fixed bucket sizes to minimize JIT compilations
+        BUCKET_SIZES = [0, 1, 2, 4, 8, 16, 32, 64]
+        
+        # Organize tests by exact n_c first
+        tests_by_nc = {}
         for idx in range(len(i_list)):
             n_c = n_conds_list[idx]
-            if n_c not in buckets:
-                buckets[n_c] = {
+            if n_c not in tests_by_nc:
+                tests_by_nc[n_c] = {
                     'i': [], 'j': [], 'tau': [], 
                     'c_vars': [], 'c_lags': []
                 }
-            buckets[n_c]['i'].append(i_list[idx])
-            buckets[n_c]['j'].append(j_list[idx])
-            buckets[n_c]['tau'].append(tau_list[idx])
-            buckets[n_c]['c_vars'].append(cond_vars_list[idx])
-            buckets[n_c]['c_lags'].append(cond_lags_list[idx])
+            tests_by_nc[n_c]['i'].append(i_list[idx])
+            tests_by_nc[n_c]['j'].append(j_list[idx])
+            tests_by_nc[n_c]['tau'].append(tau_list[idx])
+            tests_by_nc[n_c]['c_vars'].append(cond_vars_list[idx])
+            tests_by_nc[n_c]['c_lags'].append(cond_lags_list[idx])
+
+        # Assign each n_c to a bucket
+        # processing_queue[bucket_size] = [list of (n_c, test_dict)]
+        processing_queue = {b: [] for b in BUCKET_SIZES}
+        # Also need a catch-all for huge max_conds if any (N > 64)
+        MAX_BUCKET = 128
+        
+        for n_c, tests in tests_by_nc.items():
+            # Find smallest bucket >= n_c
+            chosen_bucket = None
+            for b in BUCKET_SIZES:
+                if b >= n_c:
+                    chosen_bucket = b
+                    break
+            
+            if chosen_bucket is None:
+                # Should fit in MAX_BUCKET or largest available
+                chosen_bucket = max(BUCKET_SIZES) if n_c <= max(BUCKET_SIZES) else n_c
+                # If n_c is huge, we might just JIT for it (or pad to it)
+                # Let's dynamically add it if needed, or use n_c itself as bucket
+                # Using n_c itself is fallback behavior
+                if n_c > max(BUCKET_SIZES):
+                    chosen_bucket = n_c
+                    if chosen_bucket not in processing_queue:
+                         processing_queue[chosen_bucket] = []
+
+            processing_queue[chosen_bucket].append((n_c, tests))
 
         # Initialize result matrices
         val_matrix = jnp.zeros((self.N, self.N, tau_max + 1))
         pval_matrix = jnp.ones((self.N, self.N, tau_max + 1))
 
         # Process each bucket
-        if self.verbosity >= 1:
-            print(f"Processing {len(buckets)} buckets of different condition sizes...")
 
-        for n_c, bucket in buckets.items():
-            n_tests = len(bucket['i'])
+        if self.verbosity >= 1:
+            print(f"Processing buckets: {[b for b, items in processing_queue.items() if items]}")
+
+        for bucket_size, subgroups in processing_queue.items():
+            if not subgroups:
+                continue
+                
+            X_bucket = []
+            Y_bucket = []
+            Z_bucket = []
+            i_bucket = []
+            j_bucket = []
+            tau_bucket = []
             
-            # Prepare JAX arrays for indices
-            i_arr = jnp.array(bucket['i'], dtype=jnp.int32)
-            j_arr = jnp.array(bucket['j'], dtype=jnp.int32)
-            tau_arr = jnp.array(bucket['tau'], dtype=jnp.int32)
+            # Collect data for all subgroups in this bucket
+            for n_c, tests in subgroups:
+                # Prepare indices
+                i_arr = jnp.array(tests['i'], dtype=jnp.int32)
+                j_arr = jnp.array(tests['j'], dtype=jnp.int32)
+                tau_arr = jnp.array(tests['tau'], dtype=jnp.int32)
+                
+                # Fetch data
+                if n_c > 0:
+                    cv_arr = jnp.array(tests['c_vars'], dtype=jnp.int32)
+                    cl_arr = jnp.array(tests['c_lags'], dtype=jnp.int32)
+                else:
+                    cv_arr = None
+                    cl_arr = None
+                
+                X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
+                    i_arr, j_arr, tau_arr, cv_arr, cl_arr, max_lag=tau_max
+                )
+                
+                # Pad Z_b to bucket_size
+                # Z_b is (Batch, T, n_c) -> (Batch, T, bucket_size)
+                pad_width = bucket_size - n_c
+                if pad_width > 0:
+                    # Pad last dimension with zeros
+                    # ((0,0), (0,0), (0, pad_width))
+                    padding = ((0, 0), (0, 0), (0, pad_width))
+                    Z_b_padded = jnp.pad(Z_b, padding, constant_values=0.0)
+                elif pad_width == 0:
+                    Z_b_padded = Z_b
+                else:
+                    # Should not happen if chosen_bucket >= n_c
+                    Z_b_padded = Z_b # Fail safe
+                
+                # If n_c=0, Z_b might be None or specialized. 
+                # get_variable_pair_batch returns None for Z if n_c=0?
+                # Let's check or handle it.
+                # Usually it returns array(0) or similar.
+                # If Z_b is None, we need to create zeros (Batch, T, bucket_size)
+                if Z_b is None and bucket_size > 0:
+                     # Create zeros
+                     T_eff = X_b.shape[1]
+                     batch_n = X_b.shape[0]
+                     Z_b_padded = jnp.zeros((batch_n, T_eff, bucket_size))
+                elif Z_b is None: # bucket_size == 0
+                     # Z_b is None, which stands for empty
+                     pass # handled by run_batch logic for None?
+                
+                # Handling bucket_size=0: call run_batch with Z=None
+                # But here we are collecting lists.
+                # If bucket_size=0, Z_list will contain Nones? 
+                # Or run_batch handles Z=None.
+                
+                X_bucket.append(X_b)
+                Y_bucket.append(Y_b)
+                if bucket_size > 0:
+                    Z_bucket.append(Z_b_padded)
+                
+                i_bucket.append(i_arr)
+                j_bucket.append(j_arr)
+                tau_bucket.append(tau_arr)
+
+            # Concatenate all subgroups
+            if not X_bucket:
+                continue
+
+            X_all = jnp.concatenate(X_bucket, axis=0)
+            Y_all = jnp.concatenate(Y_bucket, axis=0)
             
-            # Prepare conditioning sets
-            if n_c > 0:
-                cv_arr = jnp.array(bucket['c_vars'], dtype=jnp.int32)
-                cl_arr = jnp.array(bucket['c_lags'], dtype=jnp.int32)
+            if bucket_size > 0:
+                Z_all = jnp.concatenate(Z_bucket, axis=0)
             else:
-                cv_arr = None
-                cl_arr = None
-            
-            # Get Data Batch
-            # Z_b will be exactly (batch, effective_T, n_c) - NO padding needed
-            X_b, Y_b, Z_b = self.datahandler.get_variable_pair_batch(
-                i_arr, j_arr, tau_arr, cv_arr, cl_arr, max_lag=tau_max
-            )
+                Z_all = None
+
+            i_all = jnp.concatenate(i_bucket, axis=0)
+            j_all = jnp.concatenate(j_bucket, axis=0)
+            tau_all = jnp.concatenate(tau_bucket, axis=0)
             
             # Run Batched Test
-            # No masking needed since Z is dense and full rank (usually)
+            # Only JIT compiled for 'bucket_size'
             statistics, pvals = self.test.run_batch(
-                X_b, Y_b, Z_b, 
-                n_conditions=n_c
+                X_all, Y_all, Z_all, 
+                n_conditions=bucket_size
             )
             
             # Scatter results
-            val_matrix = val_matrix.at[i_arr, j_arr, tau_arr].set(statistics)
-            pval_matrix = pval_matrix.at[i_arr, j_arr, tau_arr].set(pvals)
+            val_matrix = val_matrix.at[i_all, j_all, tau_all].set(statistics)
+            pval_matrix = pval_matrix.at[i_all, j_all, tau_all].set(pvals)
+
+        if self.verbosity >= 1:
+            pbar.close()
 
         return val_matrix, pval_matrix
-

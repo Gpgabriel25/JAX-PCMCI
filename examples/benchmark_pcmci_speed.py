@@ -104,8 +104,8 @@ def main() -> None:
     pcmci.run(tau_max=1, pc_alpha=0.05)
 
     print("\nStarting benchmarks...")
-    print(f"{'Algorithm':<10} {'N':<5} {'T':<6} {'Time(s)':<10} {'Mem(MB)':<10}")
-    print("-" * 45)
+    print(f"{'Algorithm':<10} {'N':<5} {'T':<6} {'Time(s)':<10} {'Mem(MB)':<10} {'Skel(s)':<10} {'Ori(s)':<10} {'MCI(s)':<10}")
+    print("-" * 80)
 
     for n in n_values:
         for t in t_values:
@@ -118,20 +118,33 @@ def main() -> None:
             pcmci = PCMCI(handler, cond_ind_test=test, verbosity=0)
             metrics = benchmark_run("PCMCI", lambda: pcmci.run(tau_max=tau_max, pc_alpha=pc_alpha))
             
+            timers = getattr(pcmci, 'timers', {})
+            skel_time = timers.get('skeleton_discovery', 0.0)
+            ori_time = timers.get('edge_orientation', 0.0)
+            mci_time = timers.get('mci_test', 0.0)
+            
             record = {
                 "algorithm": "PCMCI",
                 "n": n,
                 "t": t,
                 "tau_max": tau_max,
                 "time": metrics["time"],
-                "memory_mb": metrics["peak_mem_mb"]
+                "memory_mb": metrics["peak_mem_mb"],
+                "skel_time": skel_time,
+                "ori_time": ori_time,
+                "mci_time": mci_time
             }
             results.append(record)
-            print(f"{'PCMCI':<10} {n:<5} {t:<6} {metrics['time']:<10.4f} {metrics['peak_mem_mb']:<10.1f}")
+            print(f"{'PCMCI':<10} {n:<5} {t:<6} {metrics['time']:<10.4f} {metrics['peak_mem_mb']:<10.1f} {skel_time:<10.4f} {ori_time:<10.4f} {mci_time:<10.4f}")
             
             # PCMCI+ Benchmark
             pcmci_plus = PCMCIPlus(handler, cond_ind_test=test, verbosity=0)
             metrics_plus = benchmark_run("PCMCI+", lambda: pcmci_plus.run(tau_max=tau_max, pc_alpha=pc_alpha))
+            
+            timers_plus = getattr(pcmci_plus, 'timers', {})
+            skel_time_p = timers_plus.get('skeleton_discovery', 0.0)
+            ori_time_p = timers_plus.get('edge_orientation', 0.0)
+            mci_time_p = timers_plus.get('mci_test', 0.0)
             
             record_plus = {
                 "algorithm": "PCMCI+",
@@ -139,14 +152,17 @@ def main() -> None:
                 "t": t,
                 "tau_max": tau_max,
                 "time": metrics_plus["time"],
-                "memory_mb": metrics_plus["peak_mem_mb"]
+                "memory_mb": metrics_plus["peak_mem_mb"],
+                "skel_time": skel_time_p,
+                "ori_time": ori_time_p,
+                "mci_time": mci_time_p
             }
             results.append(record_plus)
-            print(f"{'PCMCI+':<10} {n:<5} {t:<6} {metrics_plus['time']:<10.4f} {metrics_plus['peak_mem_mb']:<10.1f}")
+            print(f"{'PCMCI+':<10} {n:<5} {t:<6} {metrics_plus['time']:<10.4f} {metrics_plus['peak_mem_mb']:<10.1f} {skel_time_p:<10.4f} {ori_time_p:<10.4f} {mci_time_p:<10.4f}")
 
     # Save to CSV
     with open("benchmark_results.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["algorithm", "n", "t", "tau_max", "time", "memory_mb"])
+        writer = csv.DictWriter(f, fieldnames=["algorithm", "n", "t", "tau_max", "time", "memory_mb", "skel_time", "ori_time", "mci_time"])
         writer.writeheader()
         writer.writerows(results)
     

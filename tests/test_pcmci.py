@@ -94,7 +94,7 @@ class TestPCMCI:
 
         name = "Fake"
 
-        def run_batch(self, X_batch, Y_batch, Z_batch=None, alpha=None):
+        def run_batch(self, X_batch, Y_batch, Z_batch=None, alpha=None, n_conditions=None):
             # Store last Z_batch passed for assertions
             self.last_z_batch = Z_batch
             n = X_batch.shape[0]
