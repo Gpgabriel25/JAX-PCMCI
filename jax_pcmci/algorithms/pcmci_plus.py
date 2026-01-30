@@ -259,6 +259,10 @@ class PCMCIPlus(PCMCI):
             max_conds_dim=max_conds_dim,
             max_subsets=max_subsets,
         )
+        # Timer already updated? But _discover_skeleton calls are timed inside run() usually?
+        # run() wrapping timer:
+        # self.timers['skeleton_discovery'] = time.perf_counter() - t0
+        t_decode = 0.0 # Placeholder if needed outside
         self.timers['skeleton_discovery'] = time.perf_counter() - t0
 
         # Phase 2: Orientation
@@ -434,7 +438,7 @@ class PCMCIPlus(PCMCI):
             # Add symmetric entry if tau=0 (or generalized symmetry)
             # Standard PCMCI+ adds (j, i, -tau) for query convenience
             sepsets[(int(j), int(i), -int(tau))] = sep_set
-            
+
         if self.verbosity >= 1:
             n_lagged = sum(1 for j in skeleton for e in skeleton[j] if e[1] != 0)
             n_contemp = sum(1 for j in skeleton for e in skeleton[j] if e[1] == 0)
@@ -508,7 +512,10 @@ class PCMCIPlus(PCMCI):
         """
         # Initialize graph: 0 = no edge, 1 = tail, 2 = arrow, 3 = circle (undetermined)
         # graph[i, j, tau] represents the mark at j for edge from i(t-tau) to j(t)
-        graph = jnp.zeros((self.N, self.N, tau_max + 1), dtype=jnp.int32)
+        # Initialize graph: 0 = no edge, 1 = tail, 2 = arrow, 3 = circle (undetermined)
+        # graph[i, j, tau] represents the mark at j for edge from i(t-tau) to j(t)
+        # Optimization (Cycle 13): Use NumPy for graph construction to avoid JAX loop overhead
+        graph_np = np.zeros((self.N, self.N, tau_max + 1), dtype=np.int32)
 
         # Step 1: Add all skeleton edges with initial marks
         for j in skeleton:
@@ -518,30 +525,32 @@ class PCMCIPlus(PCMCI):
                 if tau > 0:
                     # Lagged link: definitely i(t-tau) -> j(t)
                     # Mark: arrow at j (2), tail at i (--> not represented for lagged)
-                    graph = graph.at[i, j, tau].set(2)  # Arrow at j
+                    graph_np[i, j, tau] = 2  # Arrow at j
                 elif tau == 0:
                     # Contemporaneous: initially undirected (circle-circle)
-                    graph = graph.at[i, j, 0].set(3)  # Circle
-                    graph = graph.at[j, i, 0].set(3)  # Circle (symmetric)
+                    graph_np[i, j, 0] = 3  # Circle
+                    graph_np[j, i, 0] = 3  # Circle (symmetric)
 
         # Step 2: Orient v-structures for contemporaneous edges
-        graph = self._orient_v_structures(graph, skeleton, sepsets)
+        # Pass NumPy array to avoid conversion inside
+        graph = self._orient_v_structures(graph_np, skeleton, sepsets)
 
         # Step 3: Apply Meek's orientation rules until no changes
         graph = self._apply_meek_rules(graph, skeleton, tau_max)
 
         # Convert marks to final directed graph
         # For visualization: 2 = arrow means there IS a directed edge
-        final_graph = (graph == 2).astype(jnp.int32)
+        # Ensure conversion from NumPy (if applicable) back to JAX
+        final_graph = jnp.array(graph == 2, dtype=jnp.int32)
 
         return final_graph
 
     def _orient_v_structures(
         self,
-        graph: jax.Array,
+        graph: Union[jax.Array, np.ndarray],
         skeleton: Dict,
         sepsets: Dict,
-    ) -> jax.Array:
+    ) -> Union[jax.Array, np.ndarray]:
         """
         Orient v-structures (colliders) at tau=0 using vectorized JAX operations.
         
@@ -603,19 +612,23 @@ class PCMCIPlus(PCMCI):
         # Let's perform the candidate finding vectorized (already done), then iterate 
         # only the True elements.
         
-        x_idxs, z_idxs, y_idxs = jnp.where(candidates)
+        # Use NumPy for finding indices (faster on CPU for sparse)
+        if hasattr(candidates, 'device'): # Check if JAX array
+             candidates_np = np.array(candidates)
+        else:
+             candidates_np = candidates
+             
+        x_idxs, z_idxs, y_idxs = np.where(candidates_np)
         
         # Use a list to collect updates
         updates_arrow = []
         updates_remove = []
         
         # Iterate over numpy arrays for speed
-        x_idxs_np = np.array(x_idxs)
-        z_idxs_np = np.array(z_idxs)
-        y_idxs_np = np.array(y_idxs)
+        # x_idxs, z_idxs, y_idxs are already numpy arrays from np.where
         
-        for i in range(len(x_idxs_np)):
-            x, z, y = x_idxs_np[i], z_idxs_np[i], y_idxs_np[i]
+        for i in range(len(x_idxs)):
+            x, z, y = x_idxs[i], z_idxs[i], y_idxs[i]
             
             # Check sepset
             # Key is (min(x,y), max(x,y), 0)
@@ -623,37 +636,38 @@ class PCMCIPlus(PCMCI):
             sep_set = sepsets.get(sep_key, set())
             
             # z in sepset?
-            z_in_sepset = False
-            for var, lag in sep_set:
-                if var == z and lag == 0:
-                    z_in_sepset = True
-                    break
-            
-            if not z_in_sepset:
-                # X -> Z <- Y
-                updates_arrow.append((x, z))
-                updates_arrow.append((y, z))
-                updates_remove.append((z, x))
-                updates_remove.append((z, y))
+            # Optimization: direct check if (z, 0) is in set
+            # sep_set contains (var, lag) tuples
+            if (z, 0) not in sep_set:
+                 # If not in sepset -> collider X -> Z <- Y
+                 updates_arrow.append((x, z))
+                 updates_arrow.append((y, z))
+                 updates_remove.append((z, x))
+                 updates_remove.append((z, y))
                 
         # 4. Apply updates
         if updates_arrow:
-            graph_np = np.array(graph)
+            # Ensure graph is numpy before updating
+            if hasattr(graph, 'device'):
+                graph_np = np.array(graph)
+            else:
+                graph_np = graph # Already numpy
+                
             for u, v in updates_arrow:
                 graph_np[u, v, 0] = 2 # Arrow
             for u, v in updates_remove:
                 graph_np[u, v, 0] = 0 # Remove tail
-            graph = jnp.array(graph_np)
+            graph = graph_np
             
         return graph
 
     def _apply_meek_rules(
         self,
-        graph: jax.Array,
+        graph: Union[jax.Array, np.ndarray],
         skeleton: Dict,
         tau_max: int,
         max_iterations: int = 100,
-    ) -> jax.Array:
+    ) -> Union[jax.Array, np.ndarray]:
         """
         Apply Meek's orientation rules to propagate edge directions using vectorized JAX.
 
@@ -678,7 +692,10 @@ class PCMCIPlus(PCMCI):
         # We process on CPU (numpy) because N is small and algorithms are iterative.
         # But fully vectorizing it avoids Python loops.
         
-        graph_np = np.array(graph)
+        if hasattr(graph, 'device'):
+             graph_np = np.array(graph)
+        else:
+             graph_np = graph
         
         # Adjacency matrix for checks
         # adj[i,j] means i and j are adjacent (arrow or circle)
@@ -805,7 +822,7 @@ class PCMCIPlus(PCMCI):
             if not changed:
                 break
                 
-        return jnp.array(graph_np)
+        return graph_np
 
     def _run_mci_plus(
         self,
