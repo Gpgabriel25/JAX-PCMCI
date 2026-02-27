@@ -677,7 +677,9 @@ class PCMCI:
 
         # Define buckets for max_cond_dim_limit optimization
         # Reduced from 7 buckets to 3 for faster compilation while maintaining performance
-        possible_limits = [0, 4, 32]
+        # NOTE: bucket 0 is excluded because lax.switch traces ALL branches
+        # and _chebyshev_distances/top_k fail on 0-width arrays.
+        possible_limits = [1, 4, 32]
         # Filter to only use buckets <= max_cond_dim_limit
         buckets = [l for l in possible_limits if l < max_cond_dim_limit]
         buckets.append(max_cond_dim_limit)

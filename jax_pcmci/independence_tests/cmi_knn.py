@@ -311,6 +311,10 @@ class CMIKnn(CondIndTest):
         Compute Chebyshev (max-norm) distances between all pairs.
         """
         # X: (n, d), Y: (m, d) -> output: (n, m)
+        # Guard: d=0 can occur when lax.switch traces bucket-0 branch
+        # (shapes are static during JIT tracing, so Python if is fine)
+        if X.shape[-1] == 0:
+            return jnp.zeros((X.shape[0], Y.shape[0]))
         return jnp.max(jnp.abs(X[:, None, :] - Y[None, :, :]), axis=2)
 
     @staticmethod
@@ -319,6 +323,9 @@ class CMIKnn(CondIndTest):
         """
         Compute Euclidean distances between all pairs.
         """
+        # Guard: d=0 can occur when lax.switch traces bucket-0 branch
+        if X.shape[-1] == 0:
+            return jnp.zeros((X.shape[0], Y.shape[0]))
         # Using the identity: ||x-y||^2 = ||x||^2 + ||y||^2 - 2*x.y
         XX = jnp.sum(X * X, axis=1)
         YY = jnp.sum(Y * Y, axis=1)
