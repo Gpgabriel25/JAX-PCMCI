@@ -343,6 +343,7 @@ class CondIndTest(ABC):
         Y_batch: jax.Array,
         Z_batch: Optional[jax.Array] = None,
         alpha: Optional[float] = None,
+        n_conditions: Optional[int] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         """
         Run multiple independence tests in parallel using vmap.
@@ -359,6 +360,9 @@ class CondIndTest(ABC):
         Z_batch : jax.Array or None
             Batch of conditioning variables, shape (n_tests, n_samples, n_cond).
         alpha : float or None
+        n_conditions : int or None
+            Number of actual conditioning variables (when Z is padded).
+            Subclasses may use this for correct degrees-of-freedom calculation.
         """
         # Call implementations directly - subclasses like ParCorr override
         # run_batch for better JIT strategy
