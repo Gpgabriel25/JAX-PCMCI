@@ -59,8 +59,10 @@ tpu = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/gpgabriel25/JAX-PCMCI"
-Repository = "https://github.com/gpgabriel25/JAX-PCMCI"
+Homepage = "https://gpgabriel25.github.io/jax-pcmci.html"
+Repository = "https://github.com/Gpgabriel25/JAX-PCMCI"
+Documentation = "https://gpgabriel25.github.io/jax-pcmci.html"
+Blog = "https://gpgabriel25.github.io/"
 
 [tool.setuptools.packages.find]
 where = ["."]
