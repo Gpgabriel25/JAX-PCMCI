@@ -6,6 +6,8 @@
 [![JAX](https://img.shields.io/badge/JAX-accelerated-green.svg)](https://github.com/google/jax)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+> **[Read the full write-up on the blog →](https://gpgabriel25.github.io/jax-pcmci.html)**
+
 Author's note: Hello, what brings you to this program? If you are here, I would love to hear your thoughts on this library and how you are using it. Just send me an email anytime. If you have any issues with it, please open an issue, or just tell me. I will likely get it fixed somewhat quickly.
 
 Also, side note. A lot of the performance is based off of the parameters. So changes like batch size, tau, precision, or any other parameters can make a huge difference to speed.
@@ -297,6 +299,7 @@ config = PCMCIConfig(
     batch_size=100          # Process tests in batches
 )
 config.apply()
+```
 
 ### GPU Memory Controls
 
@@ -307,7 +310,6 @@ config = PCMCIConfig(
     gpu_allocator='bfc',     # or 'platform'
 )
 config.apply()
-```
 ```
 
 ## Algorithm Details
@@ -340,7 +342,7 @@ PCMCI+ extends PCMCI to handle contemporaneous (τ=0) causal links:
 | Independence Tests | ParCorr, CMIKnn, CMISymbolic, GPDC | Many |
 | Speed (GPU) | 10-100x faster | Baseline |
 
-## 📖 References
+## References
 
 1. Runge, J. et al. (2019). "Detecting and quantifying causal associations in large nonlinear time series datasets". Science Advances, 5(11), eaau4996.
 
