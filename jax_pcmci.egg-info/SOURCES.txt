@@ -1,6 +1,11 @@
 LICENSE
 README.md
 pyproject.toml
+JAX_PCMCI.egg-info/PKG-INFO
+JAX_PCMCI.egg-info/SOURCES.txt
+JAX_PCMCI.egg-info/dependency_links.txt
+JAX_PCMCI.egg-info/requires.txt
+JAX_PCMCI.egg-info/top_level.txt
 jax_pcmci/__init__.py
 jax_pcmci/config.py
 jax_pcmci/data.py

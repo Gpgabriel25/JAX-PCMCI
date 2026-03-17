@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import warnings
+import secrets
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal, Optional, Union
@@ -296,7 +297,11 @@ class PCMCIConfig:
         jax.random.PRNGKey
             A JAX random key for reproducible random number generation.
         """
-        seed = self.random_seed if self.random_seed is not None else 0
+        if self.random_seed is None:
+            # Use system entropy when no seed is configured.
+            seed = secrets.randbits(32)
+        else:
+            seed = self.random_seed
         return jax.random.PRNGKey(seed)
 
 
@@ -377,7 +382,17 @@ def set_device(
     -----
     This function modifies JAX's global device settings. It affects all
     subsequent JAX operations, not just JAX-PCMCI.
+    On many systems, the backend must be selected *before* JAX is initialized.
+    If JAX has already been used in this process, changing the platform may
+    have no effect. For reliable behavior, set the backend via environment
+    variables before importing JAX.
     """
+    if get_config().verbosity >= 2:
+        warnings.warn(
+            "Changing JAX backends after initialization may not take effect. "
+            "For reliable device selection, set environment variables before importing JAX.",
+            UserWarning,
+        )
     device = device.lower()
 
     if device == "cpu":
@@ -545,3 +560,30 @@ def disable_debug_mode() -> None:
 
     config = get_config()
     config.jit_compile = True
+
+
+def profile_memory_usage() -> Dict[str, Any]:
+    """
+    Profile current memory usage across devices.
+    
+    Returns
+    -------
+    dict
+        Memory usage statistics for each device.
+    """
+    stats = {}
+    
+    for i, device in enumerate(jax.devices()):
+        device_stats = {'device': str(device)}
+        
+        if hasattr(device, 'memory_stats'):
+            mem_stats = device.memory_stats() or {}
+            for key in ['bytes_in_use', 'peak_bytes_in_use', 'bytes_reserved']:
+                if key in mem_stats:
+                    device_stats[key] = mem_stats[key]
+                    device_stats[f'{key}_mb'] = mem_stats[key] / 1024**2
+                    device_stats[f'{key}_gb'] = mem_stats[key] / 1024**3
+        
+        stats[f'device_{i}'] = device_stats
+    
+    return stats

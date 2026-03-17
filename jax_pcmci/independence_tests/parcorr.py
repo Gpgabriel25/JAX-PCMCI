@@ -328,6 +328,164 @@ class ParCorr(CondIndTest):
             # Partial correlation via residuals
             return _compute_partial_correlation_jit(X, Y, Z)
 
+    @staticmethod
+    @jax.jit
+    def _compute_correlation(X: jax.Array, Y: jax.Array) -> jax.Array:
+        """
+        Compute Pearson correlation between X and Y.
+
+        Uses a numerically stable computation via centered and normalized
+        vectors.
+        """
+        # Center the variables
+        X_centered = X - jnp.mean(X)
+        Y_centered = Y - jnp.mean(Y)
+
+        # Compute correlation
+        numerator = jnp.sum(X_centered * Y_centered)
+        denominator = jnp.sqrt(jnp.sum(X_centered**2) * jnp.sum(Y_centered**2))
+
+        # Handle zero denominator safely
+        # Ensure we don't divide by zero even in the inactive branch
+        safe_denominator = jnp.where(denominator > 1e-10, denominator, 1.0)
+        correlation = jnp.where(
+            denominator > 1e-10,
+            numerator / safe_denominator,
+            0.0
+        )
+
+        # Clip to [-1, 1] for numerical stability
+        return jnp.clip(correlation, -1.0, 1.0)
+    
+    @staticmethod
+    @jax.jit
+    def _efficient_correlation_matrix(data: jax.Array) -> jax.Array:
+        """
+        Compute correlation matrix efficiently for multiple variables.
+        
+        More efficient than computing pairwise correlations separately.
+        
+        Parameters
+        ----------
+        data : jax.Array
+            Data matrix of shape (n_samples, n_variables).
+        
+        Returns
+        -------
+        jax.Array
+            Correlation matrix of shape (n_variables, n_variables).
+        """
+        # Center the data
+        data_centered = data - jnp.mean(data, axis=0, keepdims=True)
+        
+        # Compute covariance matrix
+        n = data.shape[0]
+        cov_matrix = (data_centered.T @ data_centered) / (n - 1)
+        
+        # Convert to correlation matrix
+        stds = jnp.sqrt(jnp.diag(cov_matrix))
+        stds_safe = jnp.where(stds > 1e-12, stds, 1.0)
+        
+        # Broadcast for efficient division
+        corr_matrix = cov_matrix / (stds_safe[:, None] * stds_safe[None, :])
+        
+        # Ensure diagonal is 1.0 and clip to [-1, 1]
+        corr_matrix = jnp.where(
+            jnp.eye(corr_matrix.shape[0], dtype=bool),
+            1.0,
+            jnp.clip(corr_matrix, -1.0, 1.0)
+        )
+        
+        return corr_matrix
+
+    @staticmethod
+    @jax.jit
+    def _compute_partial_correlation(
+        X: jax.Array, Y: jax.Array, Z: jax.Array
+    ) -> jax.Array:
+        """
+        Compute partial correlation via OLS residuals.
+
+        This computes the correlation between the residuals of X and Y
+        after regressing each on Z.
+        """
+        # Get residuals from regressing X on Z
+        X_residual = ParCorr._compute_residual(X, Z)
+
+        # Get residuals from regressing Y on Z
+        Y_residual = ParCorr._compute_residual(Y, Z)
+
+        # Correlation of residuals
+        return ParCorr._compute_correlation(X_residual, Y_residual)
+
+    @staticmethod
+    @jax.jit
+    def _compute_residual(target: jax.Array, predictors: jax.Array) -> jax.Array:
+        """
+        Compute OLS residuals: target - Z @ (Z^T Z)^{-1} Z^T target
+
+        Optimized using robust numerical methods for edge cases.
+        """
+        # Ensure 2D
+        if predictors.ndim == 1:
+            predictors = predictors.reshape(-1, 1)
+
+        n, p = predictors.shape
+        
+        # Check for degenerate cases - use jnp.where instead of if statements
+        target_c = target - jnp.mean(target)
+        
+        # Handle empty predictors case
+        result_empty = target_c
+        
+        # Center data to avoid adding intercept column
+        predictors_c = predictors - jnp.mean(predictors, axis=0)
+        
+        # Check for constant predictors using JAX-compatible operations
+        pred_stds = jnp.std(predictors_c, axis=0)
+        valid_cols = pred_stds > 1e-12
+        
+        # Handle case where all predictors are constant
+        result_all_constant = target_c
+        
+        # Filter to valid columns
+        # Create mask matrix to select valid columns
+        valid_mask = jnp.where(valid_cols, 1.0, 0.0)
+        predictors_masked = predictors_c * valid_mask[None, :]
+        
+        # Use pseudo-inverse for robust solution
+        # Compute condition number to check for numerical issues
+        U, s, Vt = jnp.linalg.svd(predictors_masked, full_matrices=False)
+        
+        # Check for numerical issues using condition number
+        s_max = jnp.max(s)
+        s_min = jnp.max(s * (s > 1e-12))
+        condition_ok = jnp.where(s_min > 0, s_max / s_min < 1e12, False)
+        
+        # Compute pseudoinverse using SVD for better numerical stability
+        s_inv = jnp.where(s > 1e-12, 1.0 / s, 0.0)
+        pred_pinv = Vt.T @ jnp.diag(s_inv) @ U.T
+        coeffs = pred_pinv @ target_c
+        predicted = predictors_masked @ coeffs
+        residual_normal = target_c - predicted
+        
+        # Use original target if numerical issues detected
+        residual = jnp.where(condition_ok, residual_normal, target_c)
+            
+        # Choose result based on conditions
+        result = jnp.where(
+            p == 0,  # No predictors
+            result_empty,
+            jnp.where(
+                jnp.sum(valid_cols) == 0,  # All predictors constant
+                result_all_constant,
+                residual  # Normal case
+            )
+        )
+        
+        return result
+
+    @partial(jax.jit, static_argnums=(0,))
     def compute_pvalue(
         self, statistic: jax.Array, n_samples: int, n_conditions: int
     ) -> jax.Array:

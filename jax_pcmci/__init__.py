@@ -53,12 +53,13 @@ from jax_pcmci.independence_tests import (
 )
 from jax_pcmci.algorithms import PCMCI, PCMCIPlus
 from jax_pcmci.results import PCMCIResults
-from jax_pcmci.config import PCMCIConfig, set_device, get_device_info
+from jax_pcmci.config import PCMCIConfig, set_device, get_device_info, profile_memory_usage
 from jax_pcmci.parallel import (
     ParallelConfig,
     parallel_map,
     batch_independence_tests,
     benchmark_parallel_modes,
+    ProgressTracker,
 )
 from jax_pcmci import precompile
 
@@ -83,6 +84,7 @@ __all__ = [
     "PCMCIConfig",
     "set_device",
     "get_device_info",
+    "profile_memory_usage",
     # Parallel utilities
     "ParallelConfig",
     "parallel_map",
@@ -90,5 +92,6 @@ __all__ = [
     "benchmark_parallel_modes",
     # Precompilation
     "precompile",
+    "ProgressTracker",
 ]
 

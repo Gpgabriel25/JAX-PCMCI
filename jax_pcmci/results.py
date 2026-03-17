@@ -170,31 +170,55 @@ class PCMCIResults:
     def _compute_graph(self) -> None:
         """Compute the significant link graph with optional FDR correction."""
         pvals = np.array(self.pval_matrix)
+        # Only include tested links in multiple-testing correction.
+        mask = np.ones_like(pvals, dtype=bool)
+        if self.tau_min > 0:
+            mask[:, :, : self.tau_min] = False
+        # Exclude contemporaneous self-links
+        for i in range(self.N):
+            mask[i, i, 0] = False
 
         if self.fdr_method is None:
             # No correction
-            self._adjusted_pvalues = jnp.array(pvals)
-            graph = (pvals < self.alpha_level).astype(np.int32)
+            adjusted = np.where(mask, pvals, 1.0)
+            self._adjusted_pvalues = jnp.array(adjusted)
+            graph = ((pvals < self.alpha_level) & mask).astype(np.int32)
 
         elif self.fdr_method == "bonferroni":
-            # Bonferroni correction
-            n_tests = pvals.size
-            adjusted = np.minimum(pvals * n_tests, 1.0)
+            # Bonferroni correction (only for tested links)
+            n_tests = int(np.sum(mask))
+            if n_tests == 0:
+                adjusted = np.ones_like(pvals)
+            else:
+                adjusted = np.where(mask, np.minimum(pvals * n_tests, 1.0), 1.0)
             self._adjusted_pvalues = jnp.array(adjusted)
-            graph = (adjusted < self.alpha_level).astype(np.int32)
+            graph = ((adjusted < self.alpha_level) & mask).astype(np.int32)
 
         elif self.fdr_method == "fdr_bh":
-            # Benjamini-Hochberg FDR correction
-            adjusted = self._benjamini_hochberg(pvals)
+            # Benjamini-Hochberg FDR correction (only for tested links)
+            adjusted = np.ones_like(pvals)
+            if np.any(mask):
+                adjusted_vals = self._benjamini_hochberg(pvals[mask])
+                adjusted[mask] = adjusted_vals
             self._adjusted_pvalues = jnp.array(adjusted)
-            graph = (adjusted < self.alpha_level).astype(np.int32)
+            graph = ((adjusted < self.alpha_level) & mask).astype(np.int32)
 
         else:
             raise ValueError(f"Unknown FDR method: {self.fdr_method}")
 
-        # Set diagonal at tau=0 to zero (no self-loops at same time)
+        # Ensure contemporaneous self-loops are not marked
         for i in range(self.N):
             graph[i, i, 0] = 0
+            
+        # If oriented graph is provided (PCMCI+), use it to filter and direct edges.
+        # This ensures that we respect the orientation phase results (X->Y vs Y->X).
+        if self.oriented_graph is not None:
+            oriented = np.array(self.oriented_graph)
+            # Keep edge only if it exists in oriented graph (as Arrow=2 or Circle=3)
+            # This handles the directionality: if X->Y, oriented[X,Y]=2 but oriented[Y,X]=0.
+            # So graph[Y,X] will become 0 even if p-value is significant.
+            struct_mask = (oriented == 2) | (oriented == 3)
+            graph = graph & struct_mask.astype(np.int32)
         
         self._graph = jnp.array(graph)
 

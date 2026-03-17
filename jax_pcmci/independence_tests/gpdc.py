@@ -323,7 +323,7 @@ class GPDCond(CondIndTest):
 
         return D - row_mean - col_mean + grand_mean
 
-    @partial(jax.jit, static_argnums=(0, 2, 3))
+    @partial(jax.jit, static_argnums=(0,))
     def compute_pvalue(
         self, statistic: jax.Array, n_samples: int, n_conditions: int
     ) -> jax.Array:
@@ -346,6 +346,10 @@ class GPDCond(CondIndTest):
         jax.Array
             Approximate p-value.
         """
+        # Need at least 3 samples for meaningful t-test (df >= 1)
+        if n_samples < 3:
+            return jnp.array(1.0)
+        
         # Approximate t-statistic for distance correlation
         # Under H0, T = sqrt((n-2)/(1-R²)) * R ~ t(n-2) approximately
         n = n_samples
@@ -357,7 +361,8 @@ class GPDCond(CondIndTest):
 
         # Two-sided p-value from t-distribution
         from jax.scipy.stats import t as t_dist
-        pvalue = 2 * (1 - t_dist.cdf(jnp.abs(T), df=n - 2))
+        df = jnp.maximum(n - 2, 1)  # Ensure df >= 1
+        pvalue = 2 * (1 - t_dist.cdf(jnp.abs(T), df=df))
 
         return jnp.clip(pvalue, 0.0, 1.0)
 

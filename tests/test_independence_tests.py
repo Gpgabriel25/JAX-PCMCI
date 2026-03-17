@@ -228,5 +228,134 @@ class TestPermutationTesting:
         assert result.significant
 
 
+class TestBootstrapTesting:
+    """Tests for bootstrap-based significance testing."""
+    
+    def test_bootstrap_pvalue_range(self):
+        """Test that bootstrap p-values are in [0, 1]."""
+        key = jax.random.PRNGKey(42)
+        X = jax.random.normal(key, (100,))
+        Y = jax.random.normal(jax.random.PRNGKey(123), (100,))
+        
+        test = ParCorr(significance='bootstrap', n_permutations=50)
+        result = test.run(X, Y)
+        
+        assert 0 <= result.pvalue <= 1
+    
+    def test_bootstrap_detects_independence(self):
+        """Test that bootstrap gives high p-value for independent variables."""
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 2)
+        X = jax.random.normal(keys[0], (200,))
+        Y = jax.random.normal(keys[1], (200,))
+        
+        test = ParCorr(significance='bootstrap', n_permutations=100)
+        result = test.run(X, Y)
+        
+        # Should not be significant for truly independent variables
+        # Use a very lenient threshold due to randomness
+        assert result.pvalue > 0.01
+    
+    def test_bootstrap_detects_dependence(self):
+        """Test that bootstrap gives low p-value for dependent variables."""
+        key = jax.random.PRNGKey(42)
+        X = jax.random.normal(key, (200,))
+        Y = X * 0.9 + 0.1 * jax.random.normal(key, (200,))
+        
+        test = ParCorr(significance='bootstrap', n_permutations=100)
+        result = test.run(X, Y)
+        
+        assert result.pvalue < 0.05
+        assert result.significant
+    
+    def test_bootstrap_conditional_independence(self):
+        """Test bootstrap handles conditional independence correctly."""
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 3)
+        
+        n = 300
+        Z = jax.random.normal(keys[0], (n, 1))  # Confounder
+        X = 0.8 * Z[:, 0] + 0.2 * jax.random.normal(keys[1], (n,))
+        Y = 0.8 * Z[:, 0] + 0.2 * jax.random.normal(keys[2], (n,))
+        
+        test = ParCorr(significance='bootstrap', n_permutations=100)
+        
+        # Without conditioning: should detect spurious correlation
+        result_uncond = test.run(X, Y)
+        assert result_uncond.significant
+        
+        # With conditioning on Z: should show conditional independence
+        result_cond = test.run(X, Y, Z)
+        # The conditional p-value should be higher
+        assert result_cond.pvalue > result_uncond.pvalue
+
+
+class TestEdgeCases:
+    """Tests for edge cases and numerical stability."""
+    
+    def test_perfect_correlation_clipped(self):
+        """Test that perfect correlation is handled correctly."""
+        X = jnp.array([1., 2., 3., 4., 5.])
+        Y = X * 2 + 1  # Perfect linear relationship
+        
+        test = ParCorr()
+        result = test.run(X, Y)
+        
+        # Statistic should be exactly 1 (or very close)
+        assert abs(result.statistic) > 0.999
+        # P-value should be very small
+        assert result.pvalue < 0.01
+    
+    def test_constant_variable_handled(self):
+        """Test that constant variables don't cause errors."""
+        X = jnp.array([1., 2., 3., 4., 5.])
+        Y = jnp.ones(5) * 3.0  # Constant
+        
+        test = ParCorr()
+        result = test.run(X, Y)
+        
+        # Correlation with constant should be 0
+        assert abs(result.statistic) < 0.01
+    
+    def test_cmi_small_k_relative_to_n(self):
+        """Test CMI with k close to sample size."""
+        key = jax.random.PRNGKey(42)
+        X = jax.random.normal(key, (20,))
+        Y = jax.random.normal(jax.random.PRNGKey(1), (20,))
+        
+        # k=15 is close to n=20
+        test = CMIKnn(k=15)
+        stat = test.compute_statistic(X, Y)
+        
+        assert stat >= 0
+        assert jnp.isfinite(stat)
+    
+    def test_parcorr_insufficient_df(self):
+        """Test ParCorr returns pval=1.0 when degrees of freedom is insufficient."""
+        X = jnp.array([1., 2., 3., 4., 5.])
+        Y = jnp.array([2., 4., 5., 4., 5.])
+        Z = jnp.array([[0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5], [0.5, 0.6]])
+        
+        test = ParCorr()
+        result = test.run(X, Y, Z)
+        
+        # With n=5 and n_cond=2, df=5-2-3=0 which is insufficient
+        # Should return conservative pvalue=1.0
+        assert result.pvalue == 1.0
+    
+    def test_cmi_insufficient_samples_for_k(self):
+        """Test CMI returns pval=1.0 when n_samples < 2*k+1."""
+        key = jax.random.PRNGKey(42)
+        X = jax.random.normal(key, (15,))
+        Y = jax.random.normal(jax.random.PRNGKey(43), (15,))
+        
+        # k=10, min_samples=2*10+1=21, but we only have 15 samples
+        test = CMIKnn(k=10, significance='analytic')
+        result = test.run(X, Y)
+        
+        # Should return conservative pvalue=1.0
+        assert result.pvalue == 1.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

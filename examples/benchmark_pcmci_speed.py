@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import os
 import time
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 import csv
 import jax
 import jax.numpy as jnp
@@ -43,8 +46,11 @@ def _get_mem_usage_mb() -> float:
     try:
         import psutil
         return psutil.Process().memory_info().rss / 1e6
-    except ImportError:
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except Exception:
+        # ru_maxrss is KB on Linux
+        if resource:
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        return 0.0
 
 def benchmark_run(label: str, fn, warmup: bool = True) -> dict:
     if warmup:

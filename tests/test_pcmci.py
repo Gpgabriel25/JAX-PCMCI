@@ -185,6 +185,37 @@ class TestPCMCI:
         # With both limits zero, conditioning sets should be empty => Z_batch is None
         assert getattr(fake_test, "last_z_batch", None) is None
 
+    def test_input_validation_tau_max_too_large(self):
+        """Test that tau_max larger than data permits raises ValueError."""
+        data = jax.random.normal(jax.random.PRNGKey(42), (10, 3))
+        handler = DataHandler(data)
+        pcmci = PCMCI(handler, cond_ind_test=ParCorr(), verbosity=0)
+        
+        # Only 10 time points, tau_max=8 leaves 2 effective samples, which is insufficient
+        with pytest.raises(ValueError, match="Insufficient data"):
+            pcmci.run(tau_max=8)
+    
+    def test_input_validation_invalid_alpha(self):
+        """Test that invalid alpha values raise ValueError."""
+        data = jax.random.normal(jax.random.PRNGKey(42), (100, 3))
+        handler = DataHandler(data)
+        pcmci = PCMCI(handler, cond_ind_test=ParCorr(), verbosity=0)
+        
+        with pytest.raises(ValueError, match="alpha_level must be between"):
+            pcmci.run(tau_max=2, alpha_level=1.5)
+        
+        with pytest.raises(ValueError, match="pc_alpha must be between"):
+            pcmci.run(tau_max=2, pc_alpha=-0.1)
+    
+    def test_input_validation_invalid_fdr_method(self):
+        """Test that invalid FDR method raises ValueError."""
+        data = jax.random.normal(jax.random.PRNGKey(42), (100, 3))
+        handler = DataHandler(data)
+        pcmci = PCMCI(handler, cond_ind_test=ParCorr(), verbosity=0)
+        
+        with pytest.raises(ValueError, match="fdr_method must be"):
+            pcmci.run(tau_max=2, fdr_method='invalid')
+
 
 class TestPCMCIPlus:
     """Tests for PCMCI+ algorithm."""

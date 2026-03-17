@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional, Tuple, Union
 import jax
 import jax.numpy as jnp
 from functools import partial
+import secrets
 
 from jax_pcmci.config import get_config
 
@@ -92,6 +93,9 @@ class TestResult:
             f"TestResult({self.test_name}: stat={self.statistic:.4f}, "
             f"p={self.pvalue:.4f}{sig_str}, n={self.n_samples})"
         )
+
+    # Prevent pytest from collecting this dataclass as a test case.
+    __test__ = False
 
 
 class CondIndTest(ABC):
@@ -175,7 +179,14 @@ class CondIndTest(ABC):
             raise ValueError(f"n_permutations must be positive, got {n_permutations}")
 
         # Set up random key (fold-in counter ensures unique draws per call)
-        seed = random_seed if random_seed is not None else 0
+        config_seed = get_config().random_seed
+        if random_seed is not None:
+            seed = random_seed
+        elif config_seed is not None:
+            seed = config_seed
+        else:
+            seed = secrets.randbits(32)
+        self._current_seed = seed
         self._base_key = jax.random.PRNGKey(seed)
         self._rng_counter = 0
 
@@ -415,8 +426,21 @@ class CondIndTest(ABC):
 
     def _next_key(self) -> jax.Array:
         """Return a new RNG key derived from the base seed."""
-        self._rng_counter += 1
-        return jax.random.fold_in(self._base_key, self._rng_counter)
+        if self._random_seed is None:
+            # Allow global config seed changes to take effect.
+            config_seed = get_config().random_seed
+            if config_seed is not None and config_seed != self._current_seed:
+                self._current_seed = config_seed
+                self._base_key = jax.random.PRNGKey(config_seed)
+                self._rng_counter = 0
+        # Use thread-safe atomic counter for thread safety
+        import threading
+        if not hasattr(self, '_counter_lock'):
+            self._counter_lock = threading.Lock()
+        with self._counter_lock:
+            self._rng_counter += 1
+            counter_val = self._rng_counter
+        return jax.random.fold_in(self._base_key, counter_val)
 
     def _prepare_inputs(
         self, X: jax.Array, Y: jax.Array, Z: Optional[jax.Array]
@@ -485,7 +509,16 @@ class CondIndTest(ABC):
         Z: Optional[jax.Array],
         observed_stat: jax.Array,
     ) -> jax.Array:
-        """Compute p-value using bootstrap resampling (vectorized)."""
+        """
+        Compute p-value using bootstrap under the null hypothesis.
+        
+        This uses a residual bootstrap approach: we break the X-Y dependence
+        by resampling X independently (like permutation) while bootstrapping
+        Y and Z together to estimate the null distribution.
+        
+        For conditional independence testing, this is more appropriate than
+        naive bootstrap which would preserve the X-Y dependence.
+        """
         key = self._next_key()
         if Z is None:
             return self._bootstrap_pvalue_no_z(X, Y, observed_stat, key)
@@ -500,8 +533,12 @@ class CondIndTest(ABC):
         boot_keys = jax.random.split(key, self.n_permutations)
 
         def single_bootstrap(k):
-            idx = jax.random.choice(k, n_samples, shape=(n_samples,), replace=True)
-            return self._statistic_from_prepared(X_prep[idx], Y_prep[idx], None)
+            # Bootstrap under H0: independently resample X and Y to break any dependence
+            # This creates samples consistent with the null hypothesis of independence
+            keys = jax.random.split(k, 2)
+            idx_x = jax.random.choice(keys[0], n_samples, shape=(n_samples,), replace=True)
+            idx_y = jax.random.choice(keys[1], n_samples, shape=(n_samples,), replace=True)
+            return self._statistic_from_prepared(X_prep[idx_x], Y_prep[idx_y], None)
 
         boot_stats = jax.vmap(single_bootstrap)(boot_keys)
         return jnp.mean(jnp.abs(boot_stats) >= jnp.abs(observed_stat))
@@ -520,9 +557,14 @@ class CondIndTest(ABC):
         boot_keys = jax.random.split(key, self.n_permutations)
 
         def single_bootstrap(k):
-            idx = jax.random.choice(k, n_samples, shape=(n_samples,), replace=True)
+            # Bootstrap under H0 of conditional independence: X ⊥ Y | Z
+            # Keep (Y, Z) paired but resample X independently
+            # This breaks the conditional dependence while preserving marginal distributions
+            keys = jax.random.split(k, 2)
+            idx_x = jax.random.choice(keys[0], n_samples, shape=(n_samples,), replace=True)
+            idx_yz = jax.random.choice(keys[1], n_samples, shape=(n_samples,), replace=True)
             return self._statistic_from_prepared(
-                X_prep[idx], Y_prep[idx], Z_prep[idx]
+                X_prep[idx_x], Y_prep[idx_yz], Z_prep[idx_yz]
             )
 
         boot_stats = jax.vmap(single_bootstrap)(boot_keys)

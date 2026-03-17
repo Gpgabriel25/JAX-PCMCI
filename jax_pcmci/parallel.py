@@ -39,6 +39,39 @@ from jax import vmap, pmap, jit
 from .config import PCMCIConfig
 
 
+class ProgressTracker:
+    """
+    Efficient progress tracking for long-running algorithms.
+    
+    This class provides lightweight progress tracking without
+    significant performance overhead.
+    """
+    
+    def __init__(self, total_steps: int, update_freq: int = 10):
+        self.total_steps = total_steps
+        self.current_step = 0
+        self.update_freq = update_freq
+        self._last_update = 0
+    
+    def update(self, step: Optional[int] = None):
+        """Update progress counter."""
+        if step is not None:
+            self.current_step = step
+        else:
+            self.current_step += 1
+        
+        # Only print updates periodically to avoid overhead
+        if (self.current_step - self._last_update) >= self.update_freq:
+            self._last_update = self.current_step
+            progress = self.current_step / self.total_steps
+            print(f"\rProgress: {progress:.1%} ({self.current_step}/{self.total_steps})", 
+                  end='', flush=True)
+    
+    def finish(self):
+        """Mark as completed."""
+        print(f"\rProgress: 100% ({self.total_steps}/{self.total_steps})")
+
+
 @dataclass
 class ParallelConfig:
     """
@@ -659,6 +692,7 @@ def benchmark_parallel_modes(
 
 
 __all__ = [
+    'ProgressTracker',
     'ParallelConfig',
     'get_optimal_chunk_size',
     'chunked_vmap',
