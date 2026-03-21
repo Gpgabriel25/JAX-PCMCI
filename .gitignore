@@ -1,21 +1,59 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 
-# Environments
-.env
-.venv
-env/
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+wheels/
+*.whl
+
+# Virtual environments
+.venv/
 venv/
 ENV/
 
-# IDE / Editor files
+# Benchmark outputs & scratch
+*.pkl
+*.csv
+*.json
+benchmark_output.txt
+cold_cache_benchmark.txt
+bench_*.json
+
+# Scratch / debug scripts
+out.txt
+print_out.txt
+print_test.py
+test_hang*.py
+ab_benchmark.py
+
+# Performance log
+perf_log.md
+performance_benchmark_log.md
+
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# OS generated files
+# OS
 .DS_Store
 Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Agent artifacts
+.agent/
+.agents/
+
+# Generated example outputs
+example_*.png

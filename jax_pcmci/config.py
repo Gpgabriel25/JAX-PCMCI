@@ -309,6 +309,35 @@ class PCMCIConfig:
 _GLOBAL_CONFIG: PCMCIConfig = PCMCIConfig()
 
 
+def _ensure_default_compilation_cache() -> None:
+    """
+    Ensure a persistent JAX compilation cache directory is configured.
+
+    This runs at import time so separate Python processes can reuse compiled
+    executables without requiring an explicit `config.apply()` call.
+    """
+    if "JAX_COMPILATION_CACHE_DIR" in os.environ:
+        return
+
+    try:
+        default_cache = os.path.expanduser("~/.cache/jax_pcmci")
+        os.makedirs(default_cache, exist_ok=True)
+        os.environ["JAX_COMPILATION_CACHE_DIR"] = default_cache
+
+        # Ensure cache is active even when JAX was already imported.
+        try:
+            from jax.experimental.compilation_cache import compilation_cache as cc
+            cc.set_cache_dir(default_cache)
+        except Exception:
+            pass
+    except Exception:
+        # Fallback gracefully; JAX will run without persistent cache.
+        pass
+
+
+_ensure_default_compilation_cache()
+
+
 def get_config() -> PCMCIConfig:
     """
     Get the current global configuration.

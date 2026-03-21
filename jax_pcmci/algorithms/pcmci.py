@@ -54,7 +54,7 @@ from tqdm import tqdm
 
 from jax_pcmci.data import DataHandler
 from jax_pcmci.independence_tests.base import CondIndTest, TestResult
-from jax_pcmci.independence_tests.parcorr import ParCorr
+from jax_pcmci.independence_tests.parcorr import ParCorr, _compute_correlation_jit, _parcorr_pvalue
 from jax_pcmci.results import PCMCIResults
 from jax_pcmci.config import get_config
 
@@ -167,10 +167,50 @@ class PCMCI:
         self._parents: Dict[int, Set[Tuple[int, int]]] = {}
         self._pval_matrix: Optional[jax.Array] = None
         self._val_matrix: Optional[jax.Array] = None
-        self._batch_size_cache: Dict[Tuple[int, int], Optional[int]] = {}
+        self._batch_size_cache: Dict[Tuple[int, int, str], Optional[int]] = {}
+        self._pc_indices_cache: Dict[Tuple[int, int], Tuple[jax.Array, jax.Array, jax.Array]] = {}
+        self._is_parcorr = isinstance(self.test, ParCorr)
         
         # Profiling timers
         self.timers: Dict[str, float] = {}
+
+    def _get_pc_batched_indices(
+        self,
+        tau_max: int,
+        batch_size: int,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """
+        Get cached batched (i, j, tau) indices for PC phase.
+
+        Caches the padded and reshaped index tensors used by JIT kernels to
+        avoid rebuilding the same meshgrid and padding metadata across runs.
+        """
+        cache_key = (tau_max, batch_size)
+        if cache_key in self._pc_indices_cache:
+            return self._pc_indices_cache[cache_key]
+
+        i_idx, j_idx, tau_idx = jnp.meshgrid(
+            jnp.arange(self.N), jnp.arange(self.N), jnp.arange(tau_max + 1), indexing='ij'
+        )
+        i_flat = i_idx.reshape(-1)
+        j_flat = j_idx.reshape(-1)
+        tau_flat = tau_idx.reshape(-1)
+
+        n_links = i_flat.shape[0]
+        n_batches = (n_links + batch_size - 1) // batch_size
+        n_padded = n_batches * batch_size
+
+        pad_len = n_padded - n_links
+        i_padded = jnp.pad(i_flat, (0, pad_len), constant_values=0)
+        j_padded = jnp.pad(j_flat, (0, pad_len), constant_values=0)
+        tau_padded = jnp.pad(tau_flat, (0, pad_len), constant_values=0)
+
+        i_batched = i_padded.reshape(n_batches, batch_size)
+        j_batched = j_padded.reshape(n_batches, batch_size)
+        tau_batched = tau_padded.reshape(n_batches, batch_size)
+
+        self._pc_indices_cache[cache_key] = (i_batched, j_batched, tau_batched)
+        return i_batched, j_batched, tau_batched
 
     def _sample_condition_subsets(
         self,
@@ -243,25 +283,38 @@ class PCMCI:
             
         # Auto-compute batch size based on GPU memory
         if n_samples is not None:
-            cache_key = (n_samples, n_conditions)
+            device = jax.devices()[0]
+            device_platform = getattr(device, "platform", "unknown")
+            cache_key = (n_samples, n_conditions, device_platform)
             if cache_key in self._batch_size_cache:
                 return self._batch_size_cache[cache_key]
             try:
-                device = jax.devices()[0]
                 if hasattr(device, 'memory_stats'):
                     mem_stats = device.memory_stats() or {}
                     # Use bytes_limit if available, otherwise estimate 8GB
                     total_mem = mem_stats.get('bytes_limit', 8 * 1024**3)
                     in_use = mem_stats.get('bytes_in_use', 0)
-                    available = (total_mem - in_use) * 0.7  # Use 70% of available
+                    is_gpu = device_platform in ("gpu", "cuda")
+                    util_fraction = 0.85 if is_gpu else 0.70
+                    available = (total_mem - in_use) * util_fraction
                     
                     # Estimate bytes per test: (X + Y + Z) * dtype_size * 3 (intermediates)
                     dtype_size = jnp.dtype(config.dtype).itemsize
                     bytes_per_test = n_samples * (2 + n_conditions) * dtype_size * 3
                     
                     if bytes_per_test > 0:
-                        computed_batch = max(64, int(available / bytes_per_test))
-                        batch = min(computed_batch, 8192)  # Cap at reasonable max
+                        min_batch = 256 if is_gpu else 64
+                        max_batch = 32768 if is_gpu else 8192
+                        computed_batch = max(min_batch, int(available / bytes_per_test))
+
+                        if is_gpu:
+                            # GPU-friendly alignment improves occupancy and kernel launch behavior.
+                            computed_batch = (computed_batch // 128) * 128
+                            if computed_batch < min_batch:
+                                computed_batch = min_batch
+
+                        batch = min(computed_batch, max_batch)
+
                         self._batch_size_cache[cache_key] = batch
                         return batch
             except Exception:
@@ -573,20 +626,12 @@ class PCMCI:
         # Check T_eff
         T_full = data_values.shape[0]
         if T_full <= tau_max:
-             raise ValueError("Data length must be greater than tau_max")
+            raise ValueError("Data length must be greater than tau_max")
 
         key = jax.random.PRNGKey(42)
         
-        # Pre-compute grid indices
-        i_idx, j_idx, tau_idx = jnp.meshgrid(
-            jnp.arange(self.N), jnp.arange(self.N), jnp.arange(tau_max + 1), indexing='ij'
-        )
-        i_flat = i_idx.reshape(-1)
-        j_flat = j_idx.reshape(-1)
-        tau_flat = tau_idx.reshape(-1)
-        
         # Prepare batched inputs
-        n_links = i_flat.shape[0]
+        n_links = self.N * self.N * (tau_max + 1)
         # Use dynamic batch size based on available memory
         mem_batch_size = self._get_effective_batch_size(n_samples=self.T, n_conditions=self.N * tau_max)
         if mem_batch_size is None or mem_batch_size <= 0:
@@ -598,19 +643,10 @@ class PCMCI:
         else:
             batch_size = mem_batch_size
 
-        n_batches = (n_links + batch_size - 1) // batch_size
-        n_padded = n_batches * batch_size
-        
-        # Pad indices
-        pad_len = n_padded - n_links
-        i_padded = jnp.pad(i_flat, (0, pad_len), constant_values=0)
-        j_padded = jnp.pad(j_flat, (0, pad_len), constant_values=0)
-        tau_padded = jnp.pad(tau_flat, (0, pad_len), constant_values=0)
-        
-        # Reshape for scan/map: (n_batches, batch_size)
-        i_batched = i_padded.reshape(n_batches, batch_size)
-        j_batched = j_padded.reshape(n_batches, batch_size)
-        tau_batched = tau_padded.reshape(n_batches, batch_size)
+        i_batched, j_batched, tau_batched = self._get_pc_batched_indices(
+            tau_max=tau_max,
+            batch_size=batch_size,
+        )
         
         key, loop_key = jax.random.split(key)
 
@@ -640,8 +676,6 @@ class PCMCI:
             tau_max,
             max_cond_dim_limit
         )
-        # Block until ready to ensure timing captures computation
-        parents_mask.block_until_ready()
 
         if self.verbosity >= 1:
             # Need to pull mask to CPU for sum
@@ -676,10 +710,13 @@ class PCMCI:
         batch_keys = jax.random.split(base_key, n_batches)
 
         # Define buckets for max_cond_dim_limit optimization
-        # Reduced from 7 buckets to 3 for faster compilation while maintaining performance
+        # Reduced branch count for lower JIT compilation overhead
         # NOTE: bucket 0 is excluded because lax.switch traces ALL branches
         # and _chebyshev_distances/top_k fail on 0-width arrays.
-        possible_limits = [1, 4, 32]
+        if self.N <= 12:
+            possible_limits = [1, 8]
+        else:
+            possible_limits = [1, 8, 32]
         # Filter to only use buckets <= max_cond_dim_limit
         buckets = [l for l in possible_limits if l < max_cond_dim_limit]
         buckets.append(max_cond_dim_limit)
@@ -713,6 +750,9 @@ class PCMCI:
     
         # lax.map over batch dimension with buffer donation for efficiency
         xs = (i_batched, j_batched, tau_batched, batch_keys)
+        backend = jax.default_backend()
+        if backend in ("gpu", "tpu"):
+            return jax.vmap(body_fun)(xs)
         return jax.lax.map(body_fun, xs)
 
     def _pc_batch_kernel(
@@ -733,91 +773,117 @@ class PCMCI:
         
         # Pre-compute commonly used values
         eff_T = data_values.shape[0] - tau_max
+        empty_mask_template = jnp.zeros((self.N, tau_max + 1), dtype=jnp.bool_)
+        zero_p = jnp.array(0.0, dtype=data_values.dtype)
+        limit_indices = jnp.arange(max_cond_dim_limit)
+        parent_counts_per_target = jnp.sum(mask, axis=(0, 2))
         
         # Define the per-link test function
         def test_one_link(i, j, tau, key_in):
             is_active = mask[i, j, tau]
+            empty_mask = empty_mask_template
             
-            # Parents of target j
-            target_parents = mask[:, j, :] 
-            tp_flat = target_parents.reshape(-1)
-            
-            # Remove (i, tau) itself
-            curr_flat_idx = i * (tau_max + 1) + tau
-            tp_flat = tp_flat.at[curr_flat_idx].set(False)
-            
-            n_parents = jnp.sum(tp_flat)
+            # Fast parent-count gate for can_test
+            # n_parents for this candidate equals total active parents of j
+            # minus this candidate if active.
+            n_parents = parent_counts_per_target[j] - jnp.where(is_active, 1, 0)
             
             can_test = jnp.logical_and(is_active, n_parents >= cond_dim)
             
             def perform_test(key_in):
-                p = tp_flat.astype(jnp.float32)
-                sub_keys = jax.random.split(key_in, max_subsets)
-                
-                # Optimized: Use static limit for top_k
-                def get_subset(sk):
-                    g = -jnp.log(-jnp.log(jax.random.uniform(sk, p.shape) + 1e-20))
-                    sc = jnp.where(tp_flat, g, -1e9)
-                    # Use static limit for top_k
-                    _, idxs = jax.lax.top_k(sc, max_cond_dim_limit)
-                    c_lags = idxs % (tau_max + 1)
-                    c_vars = idxs // (tau_max + 1)
-                    return c_vars, c_lags
-
-                c_vars_all, c_lags_all = jax.vmap(get_subset)(sub_keys)
-                
                 # Pre-compute X and Y once
                 start_x = tau_max - tau
                 X_vals = jax.lax.dynamic_slice(data_values, (start_x, i), (eff_T, 1)).squeeze(1)
-                X_rep = jnp.broadcast_to(X_vals, (max_subsets, eff_T))
-                
+
                 start_y = tau_max 
                 Y_vals = jax.lax.dynamic_slice(data_values, (start_y, j), (eff_T, 1)).squeeze(1)
-                Y_rep = jnp.broadcast_to(Y_vals, (max_subsets, eff_T))
-                
-                def get_Z_matrix(c_vars, c_lags):
-                    def fetch_col(v, l):
-                        s = tau_max - l
-                        return jax.lax.dynamic_slice(data_values, (s, v), (eff_T, 1)).squeeze(1)
-                    z_mat = jax.vmap(fetch_col)(c_vars, c_lags).T 
-                    return z_mat
-                
-                Z_rep = jax.vmap(get_Z_matrix)(c_vars_all, c_lags_all)
-                
-                # Use masking (cond_dim is traced, can't use in slice shapes)
-                limit_indices = jnp.arange(max_cond_dim_limit)
-                col_mask = limit_indices < cond_dim
-                Z_masked = Z_rep * col_mask.reshape(1, 1, -1)
-                
-                _, p_vals = self.test.run_batch(
-                    X_rep, Y_rep, Z_masked, 
-                    alpha=pc_alpha, 
-                    n_conditions=cond_dim
-                )
-                
-                # Find best p-value and corresponding sepset
-                max_idx = jnp.argmax(p_vals)
-                max_pval = p_vals[max_idx]
-                
-                # Extract winning sepset info
-                winning_c_vars = c_vars_all[max_idx]
-                winning_c_lags = c_lags_all[max_idx]
-                
-                # Create mask (N, tau_max+1)
-                cond_mask = jnp.zeros((self.N, tau_max + 1), dtype=jnp.bool_)
-                # Use col_mask to only set valid entries to True
-                cond_mask = cond_mask.at[winning_c_vars, winning_c_lags].set(col_mask)
-                
-                return max_pval, cond_mask
 
-            empty_mask = jnp.zeros((self.N, tau_max + 1), dtype=jnp.bool_)
+                def unconditional_test(_):
+                    if self._is_parcorr:
+                        stat = _compute_correlation_jit(X_vals, Y_vals)
+                        pval = _parcorr_pvalue(stat, eff_T, 0)
+                        return pval, empty_mask
+
+                    _, p_vals = self.test.run_batch(
+                        X_vals[jnp.newaxis, :],
+                        Y_vals[jnp.newaxis, :],
+                        None,
+                        alpha=pc_alpha,
+                        n_conditions=0,
+                    )
+                    return p_vals[0], empty_mask
+
+                def conditional_test(_):
+                    # Parents of target j
+                    target_parents = mask[:, j, :]
+                    tp_flat = target_parents.reshape(-1)
+
+                    # Remove (i, tau) itself
+                    curr_flat_idx = i * (tau_max + 1) + tau
+                    tp_flat = tp_flat.at[curr_flat_idx].set(False)
+
+                    p = tp_flat.astype(jnp.float32)
+                    sub_keys = jax.random.split(key_in, max_subsets)
+
+                    # Optimized: Use static limit for top_k
+                    def get_subset(sk):
+                        g = -jnp.log(-jnp.log(jax.random.uniform(sk, p.shape) + 1e-20))
+                        sc = jnp.where(tp_flat, g, -1e9)
+                        # Use static limit for top_k
+                        _, idxs = jax.lax.top_k(sc, max_cond_dim_limit)
+                        c_lags = idxs % (tau_max + 1)
+                        c_vars = idxs // (tau_max + 1)
+                        return c_vars, c_lags
+
+                    c_vars_all, c_lags_all = jax.vmap(get_subset)(sub_keys)
+                    X_rep = jnp.broadcast_to(X_vals, (max_subsets, eff_T))
+                    Y_rep = jnp.broadcast_to(Y_vals, (max_subsets, eff_T))
+
+                    def get_Z_matrix(c_vars, c_lags):
+                        def fetch_col(v, l):
+                            s = tau_max - l
+                            return jax.lax.dynamic_slice(data_values, (s, v), (eff_T, 1)).squeeze(1)
+                        z_mat = jax.vmap(fetch_col)(c_vars, c_lags).T 
+                        return z_mat
+
+                    Z_rep = jax.vmap(get_Z_matrix)(c_vars_all, c_lags_all)
+
+                    # Use masking (cond_dim is traced, can't use in slice shapes)
+                    col_mask = limit_indices < cond_dim
+                    Z_masked = Z_rep * col_mask.reshape(1, 1, -1)
+
+                    _, p_vals = self.test.run_batch(
+                        X_rep, Y_rep, Z_masked,
+                        alpha=pc_alpha,
+                        n_conditions=cond_dim
+                    )
+
+                    # Find best p-value and corresponding sepset
+                    max_idx = jnp.argmax(p_vals)
+                    max_pval = p_vals[max_idx]
+
+                    # Extract winning sepset info
+                    winning_c_vars = c_vars_all[max_idx]
+                    winning_c_lags = c_lags_all[max_idx]
+
+                    # Create mask (N, tau_max+1)
+                    cond_mask = jnp.zeros((self.N, tau_max + 1), dtype=jnp.bool_)
+                    # Use col_mask to only set valid entries to True
+                    cond_mask = cond_mask.at[winning_c_vars, winning_c_lags].set(col_mask)
+
+                    return max_pval, cond_mask
+
+                return jax.lax.cond(
+                    cond_dim == 0,
+                    unconditional_test,
+                    conditional_test,
+                    operand=None,
+                )
+
             return jax.lax.cond(
                 can_test,
                 perform_test,
-                lambda k: (
-                    jnp.float32(0.0) if get_config().dtype == jnp.float32 else 0.0,
-                    empty_mask
-                ),
+                lambda k: (zero_p, empty_mask),
                 key_in
             )
 
@@ -1090,8 +1156,20 @@ class PCMCI:
         if self.verbosity >= 1:
             pbar = tqdm(total=self.N * self.N * (tau_max - tau_min + 1), desc="MCI Prep")
 
+        parents_by_var = [parents.get(i, set()) for i in range(self.N)]
+        shifted_parents_by_i_tau: Dict[Tuple[int, int], Tuple[Tuple[int, int], ...]] = {}
+        for i in range(self.N):
+            parents_i_set = parents_by_var[i]
+            for tau in range(tau_min, tau_max + 1):
+                shifted_list = []
+                for p_var, p_lag in parents_i_set:
+                    new_lag = p_lag - tau
+                    if new_lag <= 0:
+                        shifted_list.append((p_var, new_lag))
+                shifted_parents_by_i_tau[(i, tau)] = tuple(shifted_list)
+
         for j in self.selected_variables:
-            parents_j = list(parents.get(j, set()))
+            parents_j_set = parents_by_var[j]
             
             for i in range(self.N):
                 for tau in range(tau_min, tau_max + 1):
@@ -1099,21 +1177,22 @@ class PCMCI:
                         continue
                         
                     # Construct conditioning set
-                    cond_set = set(parents_j)
+                    cond_set = set(parents_j_set)
                     if (i, -tau) in cond_set:
                         cond_set.remove((i, -tau))
-                        
-                    for p_var, p_lag in parents.get(i, set()):
-                        new_lag = p_lag - tau
-                        if new_lag <= 0:
-                            cond_set.add((p_var, new_lag))
+
+                    cond_set.update(shifted_parents_by_i_tau[(i, tau)])
                             
-                    cond_list = sorted(list(cond_set))
+                    if max_conds_py is None and max_conds_px is None:
+                        cond_list = list(cond_set)
+                    else:
+                        cond_list = sorted(list(cond_set))
                     
                     # Apply limits if needed (same logic as before)
                     if max_conds_py is not None or max_conds_px is not None:
-                        py_conds = [(v, l) for v, l in cond_list if (v, l) in parents_j or (v, l-tau) in parents_j]
-                        px_conds = [(v, l) for v, l in cond_list if (v, l) not in py_conds]
+                        py_conds = [(v, l) for v, l in cond_list if (v, l) in parents_j_set or (v, l-tau) in parents_j_set]
+                        py_cond_set = set(py_conds)
+                        px_conds = [(v, l) for v, l in cond_list if (v, l) not in py_cond_set]
                         if max_conds_py is not None: py_conds = py_conds[:max_conds_py]
                         if max_conds_px is not None: px_conds = px_conds[:max_conds_px]
                         cond_list = sorted(py_conds + px_conds)
@@ -1132,22 +1211,16 @@ class PCMCI:
                     cond_lags_list.append(c_lags)
                     n_conds_list.append(n_c)
                     
-        if self.verbosity >= 1:
-            pbar.close()
-            
-        if not i_list:
-             return jnp.zeros((self.N, self.N, tau_max + 1)), jnp.ones((self.N, self.N, tau_max + 1))
-
-        if self.verbosity >= 1:
-            pbar.close()
-            
         if not i_list:
              return jnp.zeros((self.N, self.N, tau_max + 1)), jnp.ones((self.N, self.N, tau_max + 1))
 
         # Group by condition size (Bucketing) to avoid padding/masking issues
         # ParCorr is sensitive to zero-padding (singular matrix with ridge regression)
         # Optimized: Use fixed bucket sizes to minimize JIT compilations
-        BUCKET_SIZES = [0, 1, 2, 4, 8, 16, 32, 64]
+        if self.N <= 12:
+            BUCKET_SIZES = [0, 2, 8, 32]
+        else:
+            BUCKET_SIZES = [0, 8, 32]
         
         # Organize tests by exact n_c first
         tests_by_nc = {}

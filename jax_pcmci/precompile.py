@@ -39,6 +39,37 @@ DEFAULT_CONFIGS = [
 ]
 
 
+def precompile_parcorr_buckets(
+    T_eff: int,
+    bucket_sizes: List[int],
+    batch_size: int = 64,
+    verbose: bool = False,
+) -> None:
+    """
+    Precompile ParCorr run_batch kernels for specific conditioning bucket sizes.
+
+    This reduces first-hit compilation spikes in the MCI phase by forcing
+    compilation of common `(batch, T_eff, n_conditions)` signatures.
+    """
+    test = ParCorr()
+    key = jax.random.PRNGKey(7)
+
+    for bucket in bucket_sizes:
+        key, kx, ky, kz = jax.random.split(key, 4)
+        X = jax.random.normal(kx, (batch_size, T_eff))
+        Y = jax.random.normal(ky, (batch_size, T_eff))
+
+        if bucket == 0:
+            _, pvals = test.run_batch(X, Y, None, n_conditions=0)
+        else:
+            Z = jax.random.normal(kz, (batch_size, T_eff, bucket))
+            _, pvals = test.run_batch(X, Y, Z, n_conditions=bucket)
+
+        pvals.block_until_ready()
+        if verbose:
+            print(f"  Precompiled ParCorr bucket n_conditions={bucket}")
+
+
 def precompile_pcmci(
     N: int,
     T: int,
@@ -82,6 +113,14 @@ def precompile_pcmci(
     t0 = time.time()
     try:
         _ = pcmci.run(tau_max=tau_max, pc_alpha=pc_alpha)
+        # Also precompile MCI ParCorr bucket kernels used by current heuristics.
+        mci_buckets = [0, 2, 8, 32] if N <= 12 else [0, 8, 32]
+        precompile_parcorr_buckets(
+            T_eff=T - tau_max,
+            bucket_sizes=mci_buckets,
+            batch_size=min(64, max(8, N * 2)),
+            verbose=verbose,
+        )
         compile_time = time.time() - t0
         
         if verbose:
